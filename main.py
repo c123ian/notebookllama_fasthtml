@@ -1,12 +1,17 @@
 from fasthtml.common import *
-import os, random
+import os, random, base64, requests
 
 # Create app
 app, rt = fast_app()
 
-# Define upload folder
+# Define folders
 UPLOAD_FOLDER = "uploads"
+PODCAST_FOLDER = "podcasts"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PODCAST_FOLDER, exist_ok=True)
+
+# 🔄 Placeholder audio file path
+AUDIO_FILE_PATH = f"{PODCAST_FOLDER}/podcast_test.mp3"
 
 # Route: Main dashboard
 @rt("/")
@@ -21,8 +26,8 @@ def get():
         method="post",
     )
     document_list = Div(id="document-list")
-    return Title("Document Upload Demo"), Main(
-        H1("Document Upload"), add, document_list, cls="container"
+    return Title("Podcast Generator"), Main(
+        H1("Podcast Generator"), add, document_list, cls="container"
     )
 
 # Route: Upload document handler
@@ -50,30 +55,42 @@ async def upload_document(request):
 @rt("/update_progress", methods=["GET"])
 def update_progress(request):
     try:
-        # Get current progress, defaulting to 0 if not present or invalid
         percent_complete = float(request.query_params.get("percent_complete", 0))
         if percent_complete >= 1:
-            return H3("Upload Complete!", id="progress_bar")
+            return Div(
+                H3("Upload Complete!", id="progress_bar"),
+                audio_player(),
+            )
 
-        # Increment by a fixed amount (0.1 = 10% each time)
         percent_complete += 0.1
-        
-        # Return updated progress bar with the new value
         return progress_bar(min(percent_complete, 1.0))
     except (ValueError, TypeError):
-        # If there's any error parsing the value, start from 0
         return progress_bar(0)
 
+# ✅ Progress bar component
 def progress_bar(percent_complete: float):
     return Progress(
         id="progress_bar",
-        value=str(percent_complete),  # Make sure to convert to string
+        value=str(percent_complete),
         max="1",
-        hx_get=f"/update_progress?percent_complete={percent_complete}",  # Add the current progress to the URL
+        hx_get=f"/update_progress?percent_complete={percent_complete}",
         hx_trigger="every 500ms",
         hx_swap="outerHTML",
         cls="progress-bar",
     )
+
+# ✅ Audio player component
+def audio_player():
+    if not os.path.exists(AUDIO_FILE_PATH):
+        return P("Audio file not found.")
+    
+    audio_base64 = load_audio_base64(AUDIO_FILE_PATH)
+    return Audio(src=f"data:audio/mp4;base64,{audio_base64}", controls=True)
+
+# ✅ Helper to load audio file as base64
+def load_audio_base64(audio_path: str):
+    with open(audio_path, "rb") as audio_file:
+        return base64.b64encode(audio_file.read()).decode("ascii")
 
 # Route: Serve uploaded files
 @rt("/{path:path}")
