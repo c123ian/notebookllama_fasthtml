@@ -45,6 +45,7 @@ def serve():
     import base64
     import sqlite3
     import torch
+    import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from accelerate import Accelerator
     from fasthtml.common import (
@@ -70,6 +71,16 @@ def serve():
         )
     """)
     conn.commit()
+
+    # First, create the FastHTML app
+    fasthtml_app, rt = fast_app()
+
+    # Load model at server startup
+    print("Loading model...")
+    accelerator = Accelerator()
+    model = AutoModelForCausalLM.from_pretrained(MODELS_DIR, torch_dtype=torch.bfloat16, device_map=device)
+    tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
+    model, tokenizer = accelerator.prepare(model, tokenizer)
 
     # Function to create word-bounded chunks
     def create_word_bounded_chunks(text, target_chunk_size):
@@ -111,13 +122,8 @@ def serve():
     # Function to process the uploaded file
     async def process_uploaded_file(filename):
         print(f"📂 Processing file: {filename}")
-
-        # Load the model
-        accelerator = Accelerator()
-        model = AutoModelForCausalLM.from_pretrained(MODELS_DIR, torch_dtype=torch.bfloat16, device_map=device)
-        tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
-        model, tokenizer = accelerator.prepare(model, tokenizer)
-
+        output_file = os.path.join("/data", f"clean_{filename}")
+        
         # Read the uploaded file
         input_file = os.path.join(UPLOAD_FOLDER, filename)
         with open(input_file, "r", encoding="utf-8") as file:
@@ -127,7 +133,6 @@ def serve():
         chunks = create_word_bounded_chunks(text, 1000)
 
         # Process chunks and save output
-        output_file = f"clean_{filename}"
         with open(output_file, "w", encoding="utf-8") as out_file:
             for chunk_num, chunk in enumerate(chunks):
                 processed_chunk = process_chunk(chunk, chunk_num, model, tokenizer)
@@ -135,11 +140,7 @@ def serve():
                 out_file.flush()
 
         print(f"✅ Processing complete. Output saved to {output_file}")
-
-    
-
-    # Fasthtml app GUI setup
-    fasthtml_app, rt = fast_app()
+        return output_file
 
     def load_audio_base64(audio_path: str):
         with open(audio_path, "rb") as f:
@@ -161,6 +162,10 @@ def serve():
             hx_swap="outerHTML",
         )
 
+    def read_file_to_string(file_path):
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return file.read()
+
     @rt("/")
     def homepage():
         upload_input = Input(type="file", name="document", accept=".txt", required=True)
@@ -177,7 +182,6 @@ def serve():
             Div(id="upload-info"),
             cls="container mx-auto p-4"
         )
-
 
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
@@ -201,15 +205,37 @@ def serve():
         cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
         recent_file = cursor.fetchone()[0]
 
-        await process_uploaded_file(recent_file)
+        output_file_path = await process_uploaded_file(recent_file)
+        
+        # Read the processed file
+        INPUT_PROMPT = read_file_to_string(output_file_path)
+        
+        # Now use the INPUT_PROMPT with your model
+        messages = [
+            {"role": "system", "content": SYS_PROMPT},
+            {"role": "user", "content": INPUT_PROMPT},
+        ]
 
-        # Return the updated progress bar and success message directly
+        pipeline = transformers.pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            device_map="auto",
+        )
+
+        outputs = pipeline(
+            messages,
+            max_new_tokens=8126,
+            temperature=1,
+        )
+
+        print(outputs[0]["generated_text"][-1]['content'])
+
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
-            id="upload-info"
+            id="processing-results"
         )
-
 
     @rt("/update_progress", methods=["GET"])
     async def update_progress(request):
@@ -230,7 +256,6 @@ def serve():
             if percent_val > 1.0:
                 percent_val = 1.0
             return progress_bar(percent_val)
-
 
     return fasthtml_app
 
