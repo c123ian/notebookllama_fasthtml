@@ -1,39 +1,44 @@
 import modal
+import torch
 from transformers import AutoTokenizer
 
-
+# Initialize Modal app
 app = modal.App("simple-fasthtml-example")
 
-# Build an image with FastHTML installed
+# Build an image with FastHTML and necessary packages installed
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .pip_install("python-fasthtml==0.12.0","transformers","accelerate")
+    .pip_install("python-fasthtml==0.12.0", "transformers", "accelerate")
 )
 
 MODELS_DIR = "/llama_mini"
-MODEL_NAME = "Llama-3.2-3B-Instruct"  
+MODEL_NAME = "Llama-3.2-3B-Instruct"
 
-# Optional: Persisted volume to store uploads & audio
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+SYS_PROMPT = """
+You are a world-class podcast writer who has ghostwritten for Joe Rogan, Lex Fridman, Ben Shapiro, and Tim Ferriss...
+"""
+
+# Persisted volume to store uploads and model files
 try:
     data_volume = modal.Volume.lookup("my_data_volume", create_if_missing=True)
 except modal.exception.NotFoundError:
     data_volume = modal.Volume.persisted("my_data_volume")
 
-# Download the model weights
 try:
     volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
-
-
-@app.function(image=image, 
-              gpu=modal.gpu.A100(count=1, size="40GB"),
-              container_idle_timeout=10 * 60,
-              timeout=24 * 60 * 60,
-              allow_concurrent_inputs=100,
-              volumes={MODELS_DIR: volume, "/data": data_volume})
-
+@app.function(
+    image=image,
+    gpu=modal.gpu.A100(count=1, size="40GB"),
+    container_idle_timeout=10 * 60,
+    timeout=24 * 60 * 60,
+    allow_concurrent_inputs=100,
+    volumes={MODELS_DIR: volume, "/data": data_volume}
+)
 @modal.asgi_app()
 def serve():
     import os
@@ -53,7 +58,7 @@ def serve():
     DB_PATH = "/data/uploads.db"
 
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    
+
     # Initialize SQLite database
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -66,48 +71,75 @@ def serve():
     """)
     conn.commit()
 
+    # Function to create word-bounded chunks
+    def create_word_bounded_chunks(text, target_chunk_size):
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        for word in words:
+            word_length = len(word) + 1
+            if current_length + word_length > target_chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_length = word_length
+            else:
+                current_chunk.append(word)
+                current_length += word_length
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        return chunks
 
-    # download model
-    # Function to find the model path by searching for 'config.json'
-    def find_model_path(base_dir):
-        for root, dirs, files in os.walk(base_dir):
-            if "config.json" in files:
-                return root
-        return None
+    # Function to process text chunks
+    def process_chunk(text_chunk, chunk_num, model, tokenizer):
+        conversation = [
+            {"role": "system", "content": SYS_PROMPT},
+            {"role": "user", "content": text_chunk},
+        ]
+        prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                temperature=0.7,
+                top_p=0.9,
+                max_new_tokens=512
+            )
+        processed_text = tokenizer.decode(output[0], skip_special_tokens=True)[len(prompt):].strip()
+        return processed_text
 
-    # Function to find the tokenizer path by searching for 'tokenizer_config.json'
-    def find_tokenizer_path(base_dir):
-        for root, dirs, files in os.walk(base_dir):
-            if "tokenizer_config.json" in files:
-                return root
-        return None
+    # Function to process the uploaded file
+    async def process_uploaded_file(filename):
+        print(f"📂 Processing file: {filename}")
 
-    # Check if model files exist
-    model_path = find_model_path(MODELS_DIR)
-    if not model_path:
-        raise Exception(f"Could not find model files in {MODELS_DIR}")
+        # Load the model
+        accelerator = Accelerator()
+        model = AutoModelForCausalLM.from_pretrained(MODELS_DIR, torch_dtype=torch.bfloat16, device_map=device)
+        tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
+        model, tokenizer = accelerator.prepare(model, tokenizer)
 
-    # Check if tokenizer files exist
-    tokenizer_path = find_tokenizer_path(MODELS_DIR)
-    if not tokenizer_path:
-        raise Exception(f"Could not find tokenizer files in {MODELS_DIR}")
+        # Read the uploaded file
+        input_file = os.path.join(UPLOAD_FOLDER, filename)
+        with open(input_file, "r", encoding="utf-8") as file:
+            text = file.read()
 
-    print(f"Initializing model path: {model_path} and tokenizer path: {tokenizer_path}")
+        # Split text into chunks
+        chunks = create_word_bounded_chunks(text, 1000)
 
-    # Let's load in the model and start processing the text chunks
+        # Process chunks and save output
+        output_file = f"clean_{filename}"
+        with open(output_file, "w", encoding="utf-8") as out_file:
+            for chunk_num, chunk in enumerate(chunks):
+                processed_chunk = process_chunk(chunk, chunk_num, model, tokenizer)
+                out_file.write(processed_chunk + "\n")
+                out_file.flush()
 
-    accelerator = Accelerator()
-    model = AutoModelForCausalLM.from_pretrained(
-        MODELS_DIR,
-        torch_dtype=torch.bfloat16,
-        use_safetensors=True,
-        #device_map=device,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR, use_safetensors=True)
-    model, tokenizer = accelerator.prepare(model, tokenizer)
+        print(f"✅ Processing complete. Output saved to {output_file}")
 
+    
+
+    # Fasthtml app GUI setup
     fasthtml_app, rt = fast_app()
-
 
     def load_audio_base64(audio_path: str):
         with open(audio_path, "rb") as f:
@@ -162,13 +194,16 @@ def serve():
         with open(save_path, "wb") as f:
             f.write(contents)
 
-        # Insert into SQLite DB
         cursor.execute("INSERT INTO uploads (filename) VALUES (?)", (docfile.filename,))
         conn.commit()
 
-        # Return progress bar and success message
+        cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
+        recent_file = cursor.fetchone()[0]
+
+        await process_uploaded_file(recent_file)
+
         return Div(
-            P(f"✅ File '{docfile.filename}' uploaded successfully!", cls="text-green-500"),
+            P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
             id="upload-info",
             hx_swap_oob="true",
@@ -196,9 +231,9 @@ def serve():
 
     return fasthtml_app
 
-# If run locally for debugging
 if __name__ == "__main__":
     serve()
+
 
 
 
