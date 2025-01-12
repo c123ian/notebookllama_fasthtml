@@ -178,6 +178,7 @@ def serve():
             cls="container mx-auto p-4"
         )
 
+
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
         form = await request.form()
@@ -202,15 +203,16 @@ def serve():
 
         await process_uploaded_file(recent_file)
 
+        # Return the updated progress bar and success message directly
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
-            id="upload-info",
-            hx_swap_oob="true",
+            id="upload-info"
         )
 
+
     @rt("/update_progress", methods=["GET"])
-    def update_progress(request):
+    async def update_progress(request):
         percent_str = request.query_params.get("percent", "0")
         try:
             percent_val = float(percent_str)
@@ -219,7 +221,7 @@ def serve():
 
         if percent_val >= 1.0:
             return Div(
-                P("Upload complete!"),
+                P("🎉 Upload complete!"),
                 audio_player(),
                 id="progress_bar"
             )
@@ -229,10 +231,17 @@ def serve():
                 percent_val = 1.0
             return progress_bar(percent_val)
 
+
     return fasthtml_app
 
 if __name__ == "__main__":
     serve()
+
+
+
+
+
+
 
 
 
