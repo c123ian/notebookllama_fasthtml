@@ -1,12 +1,17 @@
 import modal
+from transformers import AutoTokenizer
+
 
 app = modal.App("simple-fasthtml-example")
 
 # Build an image with FastHTML installed
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .pip_install("python-fasthtml==0.12.0")
+    .pip_install("python-fasthtml==0.12.0","transformers","accelerate")
 )
+
+MODELS_DIR = "/llama_mini"
+MODEL_NAME = "Llama-3.2-3B-Instruct"  
 
 # Optional: Persisted volume to store uploads & audio
 try:
@@ -14,12 +19,29 @@ try:
 except modal.exception.NotFoundError:
     data_volume = modal.Volume.persisted("my_data_volume")
 
-@app.function(image=image, volumes={"/data": data_volume})
+# Download the model weights
+try:
+    volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
+except modal.exception.NotFoundError:
+    raise Exception("Download models first with the appropriate script")
+
+
+
+@app.function(image=image, 
+              gpu=modal.gpu.A100(count=1, size="40GB"),
+              container_idle_timeout=10 * 60,
+              timeout=24 * 60 * 60,
+              allow_concurrent_inputs=100,
+              volumes={MODELS_DIR: volume, "/data": data_volume})
+
 @modal.asgi_app()
 def serve():
     import os
     import base64
     import sqlite3
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from accelerate import Accelerator
     from fasthtml.common import (
         fast_app, H1, P, Div, Form, Input, Button, Group,
         Title, Main, Progress, Audio
@@ -44,7 +66,48 @@ def serve():
     """)
     conn.commit()
 
+
+    # download model
+    # Function to find the model path by searching for 'config.json'
+    def find_model_path(base_dir):
+        for root, dirs, files in os.walk(base_dir):
+            if "config.json" in files:
+                return root
+        return None
+
+    # Function to find the tokenizer path by searching for 'tokenizer_config.json'
+    def find_tokenizer_path(base_dir):
+        for root, dirs, files in os.walk(base_dir):
+            if "tokenizer_config.json" in files:
+                return root
+        return None
+
+    # Check if model files exist
+    model_path = find_model_path(MODELS_DIR)
+    if not model_path:
+        raise Exception(f"Could not find model files in {MODELS_DIR}")
+
+    # Check if tokenizer files exist
+    tokenizer_path = find_tokenizer_path(MODELS_DIR)
+    if not tokenizer_path:
+        raise Exception(f"Could not find tokenizer files in {MODELS_DIR}")
+
+    print(f"Initializing model path: {model_path} and tokenizer path: {tokenizer_path}")
+
+    # Let's load in the model and start processing the text chunks
+
+    accelerator = Accelerator()
+    model = AutoModelForCausalLM.from_pretrained(
+        MODELS_DIR,
+        torch_dtype=torch.bfloat16,
+        use_safetensors=True,
+        #device_map=device,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR, use_safetensors=True)
+    model, tokenizer = accelerator.prepare(model, tokenizer)
+
     fasthtml_app, rt = fast_app()
+
 
     def load_audio_base64(audio_path: str):
         with open(audio_path, "rb") as f:
