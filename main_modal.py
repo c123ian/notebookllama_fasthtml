@@ -1,7 +1,6 @@
 import modal
 import torch
 from transformers import AutoTokenizer
-from tqdm import tqdm  # 🔹 Added for progress tracking
 
 # Initialize Modal app
 app = modal.App("simple-fasthtml-example")
@@ -9,7 +8,7 @@ app = modal.App("simple-fasthtml-example")
 # Build an image with FastHTML and necessary packages installed
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .pip_install("python-fasthtml==0.12.0", "transformers", "accelerate", "tqdm")
+    .pip_install("python-fasthtml==0.12.0", "transformers", "accelerate")
 )
 
 MODELS_DIR = "/llama_mini"
@@ -99,7 +98,6 @@ try:
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
-
 @app.function(
     image=image,
     gpu=modal.gpu.A100(count=1, size="40GB"),
@@ -143,13 +141,9 @@ def serve():
 
     print("Loading model...")
     accelerator = Accelerator()
-    
-    # 🔹 Track progress for model loading
-    with tqdm(total=100, desc="🚀 Loading Model", position=0) as pbar:
-        model = AutoModelForCausalLM.from_pretrained(MODELS_DIR, torch_dtype=torch.bfloat16, device_map=device)
-        tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
-        model, tokenizer = accelerator.prepare(model, tokenizer)
-        pbar.update(100)
+    model = AutoModelForCausalLM.from_pretrained(MODELS_DIR, torch_dtype=torch.bfloat16, device_map=device)
+    tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
+    model, tokenizer = accelerator.prepare(model, tokenizer)
 
     def create_word_bounded_chunks(text, target_chunk_size):
         words = text.split()
@@ -209,6 +203,22 @@ def serve():
         with open(audio_path, "rb") as f:
             return base64.b64encode(f.read()).decode("ascii")
 
+    def audio_player():
+        if not os.path.exists(AUDIO_FILE_PATH):
+            return P("No placeholder audio file found.")
+        audio_data = load_audio_base64(AUDIO_FILE_PATH)
+        return Audio(src=f"data:audio/mp4;base64,{audio_data}", controls=True)
+
+    def progress_bar(percent):
+        return Progress(
+            id="progress_bar",
+            value=str(percent),
+            max="1",
+            hx_get=f"/update_progress?percent={percent}",
+            hx_trigger="every 500ms",
+            hx_swap="outerHTML",
+        )
+
     def read_file_to_string(file_path):
         with open(file_path, 'r', encoding='utf-8') as file:
             return file.read()
@@ -252,49 +262,65 @@ def serve():
         cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
         recent_file = cursor.fetchone()[0]
 
-        with tqdm(total=100, desc="📄 Processing Uploaded File") as pbar:
-            output_file_path = await process_uploaded_file(recent_file)
-            pbar.update(50)
-
+        output_file_path = await process_uploaded_file(recent_file)
         INPUT_PROMPT = read_file_to_string(output_file_path)
 
-        with tqdm(total=100, desc="✍️ Writing Initial Script") as pbar:
-            messages = [
-                {"role": "system", "content": SYS_PROMPT},
-                {"role": "user", "content": INPUT_PROMPT},
-            ]
-            pipeline = transformers.pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                device_map="auto",
-            )
-            outputs = pipeline(messages, max_new_tokens=8126, temperature=1)
-            pbar.update(100)
+        messages = [
+            {"role": "system", "content": SYS_PROMPT},
+            {"role": "user", "content": INPUT_PROMPT},
+        ]
 
-        first_generated_text = outputs[0]["generated_text"]
+        first_pipeline = transformers.pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            device_map="auto",
+        )
 
-        with tqdm(total=100, desc="🎭 Rewriting with Disfluencies") as pbar:
-            rewriting_messages = [
-                {"role": "system", "content": SYSTEMP_PROMPT},
-                {"role": "user", "content": first_generated_text},
-            ]
-            second_outputs = pipeline(rewriting_messages, max_new_tokens=8126, temperature=1)
-            pbar.update(100)
+        first_outputs = first_pipeline(
+            messages,
+            max_new_tokens=8126,
+            temperature=1,
+        )
+
+        first_generated_text = first_outputs[0]["generated_text"]
+
+        rewriting_messages = [
+            {"role": "system", "content": SYSTEMP_PROMPT},
+            {"role": "user", "content": first_generated_text},
+        ]
+
+        second_outputs = first_pipeline(
+            rewriting_messages,
+            max_new_tokens=8126,
+            temperature=1,
+        )
 
         final_rewritten_text = second_outputs[0]["generated_text"]
         print(final_rewritten_text)
 
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
+            progress_bar(0),
             id="processing-results"
         )
 
     return fasthtml_app
 
-
 if __name__ == "__main__":
     serve()
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
