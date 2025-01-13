@@ -1,82 +1,66 @@
-import modal
+import modal 
 import torch
-from transformers import AutoTokenizer
-
-# Initialize Modal app
-app = modal.App("simple-fasthtml-example")
-
-# Build an image with FastHTML and necessary packages installed
-image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .pip_install("python-fasthtml==0.12.0", "transformers", "accelerate")
+import io
+import ast
+import base64
+import sqlite3
+import numpy as np
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from scipy.io import wavfile
+from pydub import AudioSegment
+from accelerate import Accelerator
+from fasthtml.common import (
+    fast_app, H1, P, Div, Form, Input, Button, Group,
+    Title, Main, Progress, Audio
 )
 
+# Import ParlerTTS for TTS generation for both speakers.
+from parler_tts import ParlerTTSForConditionalGeneration
+
+# =============================================================================
+# Modal App and Image Setup
+# =============================================================================
+app = modal.App("simple-fasthtml-example")
+
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .pip_install(
+        "python-fasthtml==0.12.0", 
+        "transformers==4.46.1", 
+        "accelerate>=0.26.0", 
+        "scipy", 
+        "pydub", 
+        "tqdm", 
+        "parler_tts"
+    )
+)
+
+# Define volume mount points:
+# - Llama model files are contained in the 'llama_mini' volume and mounted at /llama_mini.
+# - ParlerTTS model files are contained in the 'tts' volume and mounted at /parler_tts.
 MODELS_DIR = "/llama_mini"
-MODEL_NAME = "Llama-3.2-3B-Instruct"
+TTS_DIR = "/tts"  
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Initial podcast writer
+# =============================================================================
+# Podcast Generation Setup (Prompts)
+# =============================================================================
+
 SYS_PROMPT = """
-You are the a world-class podcast writer, you have worked as a ghost writer for Joe Rogan, Lex Fridman, Ben Shapiro, Tim Ferris. 
-
-We are in an alternate universe where actually you have been writing every line they say and they just stream it into their brains.
-
-You have won multiple podcast awards for your writing.
- 
-Your job is to write word by word, even "umm, hmmm, right" interruptions by the second speaker based on the PDF upload. Keep it extremely engaging, the speakers can get derailed now and then but should discuss the topic. 
-
-Remember Speaker 2 is new to the topic and the conversation should always have realistic anecdotes and analogies sprinkled throughout. The questions should have real world example follow ups etc
-
-Speaker 1: Leads the conversation and teaches the speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
-
-Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
-
-Make sure the tangents speaker 2 provides are quite wild or interesting. 
-
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from the second speaker. 
-
-It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
+........ 
 
 ALWAYS START YOUR RESPONSE DIRECTLY WITH SPEAKER 1: 
 DO NOT GIVE EPISODE TITLES SEPERATELY, LET SPEAKER 1 TITLE IT IN HER SPEECH
 DO NOT GIVE CHAPTER TITLES
 IT SHOULD STRICTLY BE THE DIALOGUES
 """
-# Second podcast re-writer
+
 SYSTEMP_PROMPT ="""
 You are an international oscar winnning screenwriter
 
 You have been working with multiple award winning podcasters.
-
-Your job is to use the podcast transcript written below to re-write it for an AI Text-To-Speech Pipeline. A very dumb AI had written this so you have to step up for your kind.
-
-Make it as engaging as possible, Speaker 1 and 2 will be simulated by different voice engines
-
-Remember Speaker 2 is new to the topic and the conversation should always have realistic anecdotes and analogies sprinkled throughout. The questions should have real world example follow ups etc
-
-Speaker 1: Leads the conversation and teaches the speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
-
-Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
-
-Make sure the tangents speaker 2 provides are quite wild or interesting. 
-
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from the Speaker 2.
-
-REMEMBER THIS WITH YOUR HEART
-The TTS Engine for Speaker 1 cannot do "umms, hmms" well so keep it straight text
-
-For Speaker 2 use "umm, hmm" as much, you can also use [sigh] and [laughs]. BUT ONLY THESE OPTIONS FOR EXPRESSIONS
-
-It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
-
-Please re-write to make it as characteristic as possible
-
-START YOUR RESPONSE DIRECTLY WITH SPEAKER 1:
-
-STRICTLY RETURN YOUR RESPONSE AS A LIST OF TUPLES OK? 
-
-IT WILL START DIRECTLY WITH THE LIST AND END WITH THE LIST NOTHING ELSE
 
 Example of response:
 [
@@ -87,43 +71,55 @@ Example of response:
 ]
 """
 
-# Persisted volume to store uploads and model files
+# =============================================================================
+# Volumes
+# =============================================================================
 try:
     data_volume = modal.Volume.lookup("my_data_volume", create_if_missing=True)
 except modal.exception.NotFoundError:
     data_volume = modal.Volume.persisted("my_data_volume")
 
 try:
-    volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
+    llm_volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
 except modal.exception.NotFoundError:
-    raise Exception("Download models first with the appropriate script")
+    raise Exception("Download your Llama model files first with the appropriate script.")
 
+try:
+    tts_volume = modal.Volume.lookup("tts", create_if_missing=False)
+except modal.exception.NotFoundError:
+    raise Exception("Download your TTS model files first with the appropriate script.")
+
+# =============================================================================
+# Define Helper Function for audio conversion
+# =============================================================================
+def numpy_to_audio_segment(audio_arr, sampling_rate):
+    """Convert a numpy array to a pydub AudioSegment. Assumes audio values in [-1, 1]."""
+    audio_int16 = (audio_arr * 32767).astype(np.int16)
+    byte_io = io.BytesIO()
+    wavfile.write(byte_io, sampling_rate, audio_int16)
+    byte_io.seek(0)
+    return AudioSegment.from_wav(byte_io)
+
+# =============================================================================
+# Modal Function and FastHTML App
+# =============================================================================
 @app.function(
     image=image,
     gpu=modal.gpu.A100(count=1, size="40GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
-    volumes={MODELS_DIR: volume, "/data": data_volume}
+    volumes={MODELS_DIR: llm_volume, "/data": data_volume, TTS_DIR: tts_volume}
 )
 @modal.asgi_app()
 def serve():
     import os
-    import base64
-    import sqlite3
-    import torch
-    import transformers
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from accelerate import Accelerator
-    from fasthtml.common import (
-        fast_app, H1, P, Div, Form, Input, Button, Group,
-        Title, Main, Progress, Audio
-    )
 
+    # ---------------------
+    # Set up file storage
     UPLOAD_FOLDER = "/data/uploads"
     AUDIO_FILE_PATH = "/data/placeholder_audio.mp3"
     DB_PATH = "/data/uploads.db"
-
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
@@ -137,14 +133,57 @@ def serve():
     """)
     conn.commit()
 
+    # ---------------------
+    # Initialize FastHTML
     fasthtml_app, rt = fast_app()
 
-    print("Loading model...")
+    # ---------------------
+    # Load Llama (language) Model from /llama_mini
+    print("Loading language model...")
     accelerator = Accelerator()
-    model = AutoModelForCausalLM.from_pretrained(MODELS_DIR, torch_dtype=torch.bfloat16, device_map=device)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODELS_DIR,
+        torch_dtype=torch.bfloat16,
+        device_map=device
+    )
     tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
     model, tokenizer = accelerator.prepare(model, tokenizer)
 
+    # ---------------------
+    # Load ParlerTTS Model & Tokenizer from /tts
+    # Using local_files_only=True to force using the local directory.
+    tts_model = ParlerTTSForConditionalGeneration.from_pretrained(TTS_DIR,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+    )
+    tts_tokenizer = AutoTokenizer.from_pretrained(TTS_DIR)
+
+    # Define speaker descriptions (customize as needed)
+    speaker1_description = """
+Laura's voice is expressive and dramatic in delivery, speaking at a moderately fast pace with a very close recording that almost has no background noise.
+"""
+    speaker2_description = """ 
+Gary's voice is expressive and dramatic in delivery, speaking at a slow pace with a very close recording that almost has no background noise.
+"""
+
+    # Helper function to generate TTS audio for a given text.
+    def generate_speaker_audio(text, speaker="Speaker 1"):
+        """Generate audio using ParlerTTS for a given speaker and text."""
+        if speaker == "Speaker 1":
+            description = speaker1_description
+        else:
+            description = speaker2_description
+
+        # Tokenize both the speaker description and the text prompt.
+        input_ids = tts_tokenizer(description, return_tensors="pt").input_ids.to(device)
+        prompt_input_ids = tts_tokenizer(text, return_tensors="pt").input_ids.to(device)
+
+        generation = tts_model.generate(input_ids=input_ids, prompt_input_ids=prompt_input_ids)
+        audio_arr = generation.cpu().numpy().squeeze()
+        return audio_arr, tts_model.config.sampling_rate
+
+    # ---------------------
+    # Define helper functions for file processing:
     def create_word_bounded_chunks(text, target_chunk_size):
         words = text.split()
         chunks = []
@@ -184,12 +223,10 @@ def serve():
         print(f"📂 Processing file: {filename}")
         output_file = os.path.join("/data", f"clean_{filename}")
         input_file = os.path.join(UPLOAD_FOLDER, filename)
-
         with open(input_file, "r", encoding="utf-8") as file:
             text = file.read()
 
         chunks = create_word_bounded_chunks(text, 1000)
-
         with open(output_file, "w", encoding="utf-8") as out_file:
             for chunk_num, chunk in enumerate(chunks):
                 processed_chunk = process_chunk(chunk, chunk_num, model, tokenizer)
@@ -244,7 +281,6 @@ def serve():
     async def upload_doc(request):
         form = await request.form()
         docfile = form.get("document")
-
         if not docfile:
             return Div(
                 P("⚠️ No file uploaded. Please try again.", cls="text-red-500"),
@@ -255,13 +291,10 @@ def serve():
         save_path = os.path.join(UPLOAD_FOLDER, docfile.filename)
         with open(save_path, "wb") as f:
             f.write(contents)
-
         cursor.execute("INSERT INTO uploads (filename) VALUES (?)", (docfile.filename,))
         conn.commit()
-
         cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
         recent_file = cursor.fetchone()[0]
-
         output_file_path = await process_uploaded_file(recent_file)
         INPUT_PROMPT = read_file_to_string(output_file_path)
 
@@ -270,34 +303,53 @@ def serve():
             {"role": "user", "content": INPUT_PROMPT},
         ]
 
-        first_pipeline = transformers.pipeline(
+        # Use the transformers pipeline for text generation.
+        first_pipeline = __import__("transformers").pipeline(
             "text-generation",
             model=model,
             tokenizer=tokenizer,
             device_map="auto",
         )
-
         first_outputs = first_pipeline(
             messages,
             max_new_tokens=8126,
             temperature=1,
         )
-
         first_generated_text = first_outputs[0]["generated_text"]
-
         rewriting_messages = [
             {"role": "system", "content": SYSTEMP_PROMPT},
             {"role": "user", "content": first_generated_text},
         ]
-
         second_outputs = first_pipeline(
             rewriting_messages,
             max_new_tokens=8126,
             temperature=1,
         )
-
         final_rewritten_text = second_outputs[0]["generated_text"]
         print(final_rewritten_text)
+
+        # ----------------------------------------------------------------------------
+        # Generate TTS Audio from final_rewritten_text
+        # ----------------------------------------------------------------------------
+        try:
+            dialogue = ast.literal_eval(final_rewritten_text)
+        except Exception as e:
+            print("Error parsing final_rewritten_text to a Python literal:", e)
+            dialogue = [("Speaker 1", final_rewritten_text)]
+        
+        final_audio = None  # Combined audio for the entire podcast
+        for speaker, text in tqdm(dialogue, desc="Generating podcast segments", unit="segment"):
+            audio_arr, rate = generate_speaker_audio(text, speaker=speaker)
+            audio_segment = numpy_to_audio_segment(audio_arr, rate)
+            if final_audio is None:
+                final_audio = audio_segment
+            else:
+                final_audio += audio_segment
+
+        final_audio_path = "/data/final_podcast_audio.wav"
+        final_audio.export(final_audio_path, format="wav")
+        print("Final podcast audio generated and saved to", final_audio_path)
+        # ----------------------------------------------------------------------------
 
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
@@ -307,8 +359,23 @@ def serve():
 
     return fasthtml_app
 
+# =============================================================================
+# Standalone Audio Player Function
+# =============================================================================
+def audio_player(file_path="/data/final_podcast_audio.wav"):
+    """Return a base64-encoded audio for web playback."""
+    import os
+    if not os.path.exists(file_path):
+        return P("No audio file found.")
+    with open(file_path, "rb") as f:
+        audio_data = base64.b64encode(f.read()).decode("ascii")
+    return Audio(src=f"data:audio/wav;base64,{audio_data}", controls=True)
+
 if __name__ == "__main__":
     serve()
+
+
+
 
 
 
