@@ -1,4 +1,4 @@
-import modal 
+import modal
 import torch
 import io
 import ast
@@ -14,15 +14,9 @@ from fasthtml.common import (
     fast_app, H1, P, Div, Form, Input, Button, Group,
     Title, Main, Progress, Audio
 )
-
-# Import ParlerTTS for TTS generation for both speakers.
 from parler_tts import ParlerTTSForConditionalGeneration
 
-# =============================================================================
-# Modal App and Image Setup
-# =============================================================================
 app = modal.App("simple-fasthtml-example")
-
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -35,18 +29,9 @@ image = (
         "parler_tts"
     )
 )
-
-# Define volume mount points:
-# - Llama model files are contained in the 'llama_mini' volume and mounted at /llama_mini.
-# - ParlerTTS model files are contained in the 'tts' volume and mounted at /parler_tts.
 MODELS_DIR = "/llama_mini"
 TTS_DIR = "/tts"  
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# =============================================================================
-# Podcast Generation Setup (Prompts)
-# =============================================================================
 
 SYS_PROMPT = """
 ........ 
@@ -56,7 +41,6 @@ DO NOT GIVE EPISODE TITLES SEPERATELY, LET SPEAKER 1 TITLE IT IN HER SPEECH
 DO NOT GIVE CHAPTER TITLES
 IT SHOULD STRICTLY BE THE DIALOGUES
 """
-
 SYSTEMP_PROMPT ="""
 You are an international oscar winnning screenwriter
 
@@ -71,38 +55,26 @@ Example of response:
 ]
 """
 
-# =============================================================================
-# Volumes
-# =============================================================================
 try:
     data_volume = modal.Volume.lookup("my_data_volume", create_if_missing=True)
 except modal.exception.NotFoundError:
     data_volume = modal.Volume.persisted("my_data_volume")
-
 try:
     llm_volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download your Llama model files first with the appropriate script.")
-
 try:
     tts_volume = modal.Volume.lookup("tts", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download your TTS model files first with the appropriate script.")
 
-# =============================================================================
-# Define Helper Function for audio conversion
-# =============================================================================
 def numpy_to_audio_segment(audio_arr, sampling_rate):
-    """Convert a numpy array to a pydub AudioSegment. Assumes audio values in [-1, 1]."""
     audio_int16 = (audio_arr * 32767).astype(np.int16)
     byte_io = io.BytesIO()
     wavfile.write(byte_io, sampling_rate, audio_int16)
     byte_io.seek(0)
     return AudioSegment.from_wav(byte_io)
 
-# =============================================================================
-# Modal Function and FastHTML App
-# =============================================================================
 @app.function(
     image=image,
     gpu=modal.gpu.A100(count=1, size="40GB"),
@@ -114,14 +86,10 @@ def numpy_to_audio_segment(audio_arr, sampling_rate):
 @modal.asgi_app()
 def serve():
     import os
-
-    # ---------------------
-    # Set up file storage
     UPLOAD_FOLDER = "/data/uploads"
     AUDIO_FILE_PATH = "/data/placeholder_audio.mp3"
     DB_PATH = "/data/uploads.db"
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -132,14 +100,8 @@ def serve():
         )
     """)
     conn.commit()
-
-    # ---------------------
-    # Initialize FastHTML
     fasthtml_app, rt = fast_app()
-
-    # ---------------------
-    # Load Llama (language) Model from /llama_mini
-    print("Loading language model...")
+    print("🚀 Loading language model...")
     accelerator = Accelerator()
     model = AutoModelForCausalLM.from_pretrained(
         MODELS_DIR,
@@ -148,42 +110,29 @@ def serve():
     )
     tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
     model, tokenizer = accelerator.prepare(model, tokenizer)
-
-    # ---------------------
-    # Load ParlerTTS Model & Tokenizer from /tts
-    # Using local_files_only=True to force using the local directory.
     tts_model = ParlerTTSForConditionalGeneration.from_pretrained(TTS_DIR,
         torch_dtype=torch.bfloat16,
         device_map=device,
     )
     tts_tokenizer = AutoTokenizer.from_pretrained(TTS_DIR)
-
-    # Define speaker descriptions (customize as needed)
     speaker1_description = """
 Laura's voice is expressive and dramatic in delivery, speaking at a moderately fast pace with a very close recording that almost has no background noise.
 """
     speaker2_description = """ 
 Gary's voice is expressive and dramatic in delivery, speaking at a slow pace with a very close recording that almost has no background noise.
 """
-
-    # Helper function to generate TTS audio for a given text.
     def generate_speaker_audio(text, speaker="Speaker 1"):
-        """Generate audio using ParlerTTS for a given speaker and text."""
-        if speaker == "Speaker 1":
-            description = speaker1_description
-        else:
-            description = speaker2_description
-
-        # Tokenize both the speaker description and the text prompt.
-        input_ids = tts_tokenizer(description, return_tensors="pt").input_ids.to(device)
+        if not isinstance(text, str):
+            text = str(text)
+        desc = speaker1_description if speaker == "Speaker 1" else speaker2_description
+        print(f"🎤 Generating TTS audio for {speaker}...")
+        input_ids = tts_tokenizer(desc, return_tensors="pt").input_ids.to(device)
         prompt_input_ids = tts_tokenizer(text, return_tensors="pt").input_ids.to(device)
-
         generation = tts_model.generate(input_ids=input_ids, prompt_input_ids=prompt_input_ids)
-        audio_arr = generation.cpu().numpy().squeeze()
+        # Convert the generated tensor to float32 on CPU
+        generation = generation.cpu().float()
+        audio_arr = generation.numpy().squeeze()
         return audio_arr, tts_model.config.sampling_rate
-
-    # ---------------------
-    # Define helper functions for file processing:
     def create_word_bounded_chunks(text, target_chunk_size):
         words = text.split()
         chunks = []
@@ -201,7 +150,6 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         if current_chunk:
             chunks.append(' '.join(current_chunk))
         return chunks
-
     def process_chunk(text_chunk, chunk_num, model, tokenizer):
         conversation = [
             {"role": "system", "content": SYS_PROMPT},
@@ -218,34 +166,28 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             )
         processed_text = tokenizer.decode(output[0], skip_special_tokens=True)[len(prompt):].strip()
         return processed_text
-
     async def process_uploaded_file(filename):
-        print(f"📂 Processing file: {filename}")
+        print(f"📥 File '{filename}' uploaded!")
         output_file = os.path.join("/data", f"clean_{filename}")
         input_file = os.path.join(UPLOAD_FOLDER, filename)
         with open(input_file, "r", encoding="utf-8") as file:
             text = file.read()
-
         chunks = create_word_bounded_chunks(text, 1000)
         with open(output_file, "w", encoding="utf-8") as out_file:
             for chunk_num, chunk in enumerate(chunks):
-                processed_chunk = process_chunk(chunk, chunk_num, model, tokenizer)
-                out_file.write(processed_chunk + "\n")
+                cleaned_chunk = process_chunk(chunk, chunk_num, model, tokenizer)
+                out_file.write(cleaned_chunk + "\n")
                 out_file.flush()
-
-        print(f"✅ Processing complete. Output saved to {output_file}")
+        print(f"🧹 File '{filename}' cleaned and saved to '{output_file}'!")
         return output_file
-
     def load_audio_base64(audio_path: str):
         with open(audio_path, "rb") as f:
             return base64.b64encode(f.read()).decode("ascii")
-
     def audio_player():
         if not os.path.exists(AUDIO_FILE_PATH):
             return P("No placeholder audio file found.")
         audio_data = load_audio_base64(AUDIO_FILE_PATH)
         return Audio(src=f"data:audio/mp4;base64,{audio_data}", controls=True)
-
     def progress_bar(percent):
         return Progress(
             id="progress_bar",
@@ -255,11 +197,9 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             hx_trigger="every 500ms",
             hx_swap="outerHTML",
         )
-
     def read_file_to_string(file_path):
         with open(file_path, 'r', encoding='utf-8') as file:
             return file.read()
-
     @rt("/")
     def homepage():
         upload_input = Input(type="file", name="document", accept=".txt", required=True)
@@ -276,7 +216,6 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             Div(id="upload-info"),
             cls="container mx-auto p-4"
         )
-
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
         form = await request.form()
@@ -286,7 +225,6 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 P("⚠️ No file uploaded. Please try again.", cls="text-red-500"),
                 id="upload-info"
             )
-
         contents = await docfile.read()
         save_path = os.path.join(UPLOAD_FOLDER, docfile.filename)
         with open(save_path, "wb") as f:
@@ -297,13 +235,11 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         recent_file = cursor.fetchone()[0]
         output_file_path = await process_uploaded_file(recent_file)
         INPUT_PROMPT = read_file_to_string(output_file_path)
-
+        print("📝 Generating first script...")
         messages = [
             {"role": "system", "content": SYS_PROMPT},
             {"role": "user", "content": INPUT_PROMPT},
         ]
-
-        # Use the transformers pipeline for text generation.
         first_pipeline = __import__("transformers").pipeline(
             "text-generation",
             model=model,
@@ -316,6 +252,8 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             temperature=1,
         )
         first_generated_text = first_outputs[0]["generated_text"]
+        print("✍️  First script generated.")
+        print("🔄 Rewriting script with disfluencies...")
         rewriting_messages = [
             {"role": "system", "content": SYSTEMP_PROMPT},
             {"role": "user", "content": first_generated_text},
@@ -326,18 +264,15 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             temperature=1,
         )
         final_rewritten_text = second_outputs[0]["generated_text"]
+        print("✅ Script rewritten:")
         print(final_rewritten_text)
-
-        # ----------------------------------------------------------------------------
-        # Generate TTS Audio from final_rewritten_text
-        # ----------------------------------------------------------------------------
         try:
             dialogue = ast.literal_eval(final_rewritten_text)
         except Exception as e:
-            print("Error parsing final_rewritten_text to a Python literal:", e)
+            print("❌ Error parsing final_rewritten_text to a Python literal:", e)
             dialogue = [("Speaker 1", final_rewritten_text)]
-        
-        final_audio = None  # Combined audio for the entire podcast
+        final_audio = None
+        print("🎧 Generating podcast segments (TTS audio)...")
         for speaker, text in tqdm(dialogue, desc="Generating podcast segments", unit="segment"):
             audio_arr, rate = generate_speaker_audio(text, speaker=speaker)
             audio_segment = numpy_to_audio_segment(audio_arr, rate)
@@ -345,25 +280,17 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 final_audio = audio_segment
             else:
                 final_audio += audio_segment
-
         final_audio_path = "/data/final_podcast_audio.wav"
         final_audio.export(final_audio_path, format="wav")
-        print("Final podcast audio generated and saved to", final_audio_path)
-        # ----------------------------------------------------------------------------
-
+        print("🎶 Final podcast audio generated and saved to", final_audio_path)
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
             id="processing-results"
         )
-
     return fasthtml_app
 
-# =============================================================================
-# Standalone Audio Player Function
-# =============================================================================
 def audio_player(file_path="/data/final_podcast_audio.wav"):
-    """Return a base64-encoded audio for web playback."""
     import os
     if not os.path.exists(file_path):
         return P("No audio file found.")
@@ -373,6 +300,9 @@ def audio_player(file_path="/data/final_podcast_audio.wav"):
 
 if __name__ == "__main__":
     serve()
+
+
+
 
 
 
