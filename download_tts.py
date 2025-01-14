@@ -34,4 +34,20 @@ def download_model(model_name=DEFAULT_NAME_TTS, force_download=False):
     snapshot_download(
         repo_id=model_name,
         local_dir=TTS_DIR,
-        local_dir_use_symlinks=
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        ignore_patterns=None,
+        force_download=force_download,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.save_pretrained(TTS_DIR)
+
+    volume.commit()
+
+@app.local_entrypoint()
+def main(
+    model_name: str = DEFAULT_NAME_TTS,
+    force_download: bool = False,
+):
+    download_model.remote(model_name, force_download)
