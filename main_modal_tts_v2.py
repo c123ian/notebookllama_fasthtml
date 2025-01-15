@@ -198,33 +198,22 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         if current_chunk:
             chunks.append(' '.join(current_chunk))
         return chunks
-    
     def process_chunk(text_chunk, chunk_num, model, tokenizer):
         conversation = [
             {"role": "system", "content": SYS_PROMPT},
             {"role": "user", "content": text_chunk},
         ]
         prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
-        # Tokenize without adding extra special tokens (we assume the prompt template already includes what’s needed)
-        tokens = tokenizer(prompt, add_special_tokens=False)['input_ids']
-        processed_outputs = []
-        # Split the token list into segments of max 512
-        for i in range(0, len(tokens), 512):
-            token_segment = tokens[i:i+512]
-            input_tensor = torch.tensor([token_segment]).to(device)
-            with torch.no_grad():
-                output = model.generate(
-                    input_tensor,
-                    temperature=0.7,
-                    top_p=0.9,
-                    max_new_tokens=512
-                )
-            processed_text = tokenizer.decode(output[0], skip_special_tokens=True)
-            processed_outputs.append(processed_text)
-        return " ".join(processed_outputs)
-
-
-
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                temperature=0.7,
+                top_p=0.9,
+                max_new_tokens=512
+            )
+        processed_text = tokenizer.decode(output[0], skip_special_tokens=True)[len(prompt):].strip()
+        return processed_text
     async def process_uploaded_file(filename):
         print(f"📥 File '{filename}' uploaded!")
         output_file = os.path.join("/data", f"clean_{filename}")
@@ -243,7 +232,9 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         with open(audio_path, "rb") as f:
             return base64.b64encode(f.read()).decode("ascii")
     def audio_player(file_path="/data/final_podcast_audio.wav"):
-        import os, base64
+        import os
+        if not os.path.exists(file_path):
+            return P("No audio file found.")
         with open(file_path, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("ascii")
         return Audio(src=f"data:audio/wav;base64,{audio_data}", controls=True)
@@ -293,24 +284,145 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
         recent_file = cursor.fetchone()[0]
         output_file_path = await process_uploaded_file(recent_file)
-        
-        # Generate the podcast audio
+        INPUT_PROMPT = read_file_to_string(output_file_path)
+        print("📝 Generating first script...")
+        messages = [
+            {"role": "system", "content": SYS_PROMPT},
+            {"role": "user", "content": INPUT_PROMPT},
+        ]
+        first_pipeline = __import__("transformers").pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            device_map="auto",
+        )
+        first_outputs = first_pipeline(
+            messages,
+            max_new_tokens=8126,
+            temperature=1,
+        )
+        first_generated_text = first_outputs[0]["generated_text"]
+        print("✍️  First script generated.")
+        print("🔄 Rewriting script with disfluencies...")
+        rewriting_messages = [
+            {"role": "system", "content": SYSTEMP_PROMPT},
+            {"role": "user", "content": first_generated_text},
+        ]
+        second_outputs = first_pipeline(
+            rewriting_messages,
+            max_new_tokens=8126,
+            temperature=1,
+        )
+        final_rewritten_text = second_outputs[0]["generated_text"]
+        print("✅ Script rewritten:")
+        print(final_rewritten_text)
+        try:
+            dialogue = ast.literal_eval(final_rewritten_text)
+        except Exception as e:
+            print("❌ Error parsing final_rewritten_text to a Python literal:", e)
+            dialogue = [("Speaker 1", final_rewritten_text)]
+        final_audio = None
         print("🎧 Generating podcast segments (TTS audio)...")
+        for speaker, text in tqdm(dialogue, desc="Generating podcast segments", unit="segment"):
+            audio_arr, rate = generate_speaker_audio(text, speaker=speaker)
+            audio_segment = numpy_to_audio_segment(audio_arr, rate)
+            if final_audio is None:
+                final_audio = audio_segment
+            else:
+                final_audio += audio_segment
         final_audio_path = "/data/final_podcast_audio.wav"
-        # (audio generation code omitted for brevity)
-        
-        # Return the upload success message + audio player
+        final_audio.export(final_audio_path, format="wav")
+        print("🎶 Final podcast audio generated and saved to", final_audio_path)
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
-            audio_player(final_audio_path),
             id="processing-results"
         )
     return fasthtml_app
 
+def audio_player(file_path="/data/final_podcast_audio.wav"):
+    import os
+    if not os.path.exists(file_path):
+        return P("No audio file found.")
+    with open(file_path, "rb") as f:
+        audio_data = base64.b64encode(f.read()).decode("ascii")
+    return Audio(src=f"data:audio/wav;base64,{audio_data}", controls=True)
 
 if __name__ == "__main__":
     serve()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
