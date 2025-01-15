@@ -5,6 +5,7 @@ import ast
 import base64
 import sqlite3
 import uuid
+import re
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -30,6 +31,7 @@ image = (
         "parler_tts"
     )
 )
+
 MODELS_DIR = "/llama_mini"
 TTS_DIR = "/tts"  
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,11 +45,9 @@ You have won multiple podcast awards for your writing.
  
 Your job is to write word by word, even "umm, hmmm, right" interruptions by the second speaker based on the PDF upload. Keep it extremely engaging, the speakers can get derailed now and then but should discuss the topic. 
 
-Remember Speaker 2 is new to the topic and the conversation should always have realistic anecdotes and analogies sprinkled throughout. The questions should have real world example follow ups etc
+Remember Speaker 1 leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
 
-Speaker 1: Leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
-
-Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
+Speaker 2 keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
 
 Make sure the tangents Speaker 2 provides are quite wild or interesting. 
 
@@ -124,6 +124,12 @@ def numpy_to_audio_segment(audio_arr, sampling_rate):
     byte_io.seek(0)
     return AudioSegment.from_wav(byte_io)
 
+def preprocess_text(text):
+    text = text.strip()
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\w\s.,!?-]', '', text)
+    return text
+
 @app.function(
     image=image,
     gpu=modal.gpu.A100(count=1, size="80GB"),
@@ -157,7 +163,6 @@ def serve():
         device_map=device
     )
     tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
-    # Ensure a proper pad token is set.
     if tokenizer.pad_token is None or tokenizer.pad_token == tokenizer.eos_token:
         tokenizer.add_special_tokens({'pad_token': '<pad>'})
         tokenizer.pad_token = '<pad>'
@@ -168,6 +173,10 @@ def serve():
         device_map=device,
     )
     tts_tokenizer = AutoTokenizer.from_pretrained(TTS_DIR)
+    # Ensure TTS tokenizer has a pad token
+    if tts_tokenizer.pad_token is None:
+        tts_tokenizer.add_special_tokens({'pad_token': '<pad>'})
+        tts_tokenizer.pad_token = '<pad>'
     speaker1_description = """
 Laura's voice is expressive and dramatic in delivery, speaking at a moderately fast pace with a very close recording that almost has no background noise.
 """
@@ -175,20 +184,40 @@ Laura's voice is expressive and dramatic in delivery, speaking at a moderately f
 Gary's voice is expressive and dramatic in delivery, speaking at a slow pace with a very close recording that almost has no background noise.
 """
     def generate_speaker_audio(text, speaker="Speaker 1"):
+        # If text is not a string, convert it (handles list/dict cases)
         if not isinstance(text, str):
             text = str(text)
+        text = preprocess_text(text)
         desc = speaker1_description if speaker == "Speaker 1" else speaker2_description
         print(f"🎤 Generating TTS audio for {speaker}... Text length: {len(text)} characters")
-        input_ids = tts_tokenizer(desc, return_tensors="pt").input_ids.to(device)
-        prompt_input_ids = tts_tokenizer(text, return_tensors="pt").input_ids.to(device)
-        generation = tts_model.generate(
-            input_ids=input_ids, 
-            prompt_input_ids=prompt_input_ids
-        )
-        generation = generation.cpu().float()
-        audio_arr = generation.numpy().squeeze()
+        input_data = tts_tokenizer(desc, return_tensors="pt", truncation=True, max_length=512, padding="max_length").to(device)
+        prompt_data = tts_tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding="max_length").to(device)
+        try:
+            generation = tts_model.generate(
+                input_ids=input_data["input_ids"],
+                attention_mask=input_data["attention_mask"],
+                prompt_input_ids=prompt_data["input_ids"],
+                temperature=0.9
+            )
+            generation = generation.cpu().float()
+            audio_arr = generation.numpy().squeeze()
+            if np.isnan(audio_arr).any() or np.isinf(audio_arr).any():
+                raise ValueError("Invalid audio generation output")
+        except Exception as e:
+            print(f"Error generating audio for {speaker}: {str(e)}")
+            audio_arr = np.zeros(int(tts_model.config.sampling_rate))
         return audio_arr, tts_model.config.sampling_rate
-    
+
+    def concatenate_audio_segments(segments, sampling_rates):
+        final_audio = None
+        for segment, rate in zip(segments, sampling_rates):
+            audio_segment = numpy_to_audio_segment(segment, rate)
+            if final_audio is None:
+                final_audio = audio_segment
+            else:
+                final_audio = final_audio.append(audio_segment, crossfade=100)
+        return final_audio
+
     def create_word_bounded_chunks(text, target_chunk_size):
         words = text.split()
         chunks = []
@@ -292,7 +321,6 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
-        # Generate a UUID to use for output file naming
         file_uuid = uuid.uuid4().hex
         form = await request.form()
         docfile = form.get("document")
@@ -353,18 +381,27 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 dialogue = [("Speaker 1", final_rewritten_text)]
         else:
             dialogue = final_rewritten_text
-        # If dialogue is a list of dictionaries, convert to tuples.
         if isinstance(dialogue, list) and dialogue and isinstance(dialogue[0], dict):
             dialogue = [(item.get("role", ""), item.get("content", "")) for item in dialogue]
-        final_audio = None
+        # Force Role Mapping: remap roles to "Speaker 1" and "Speaker 2"
+        if isinstance(dialogue, list):
+            mapped_dialogue = []
+            for role, content in dialogue:
+                if role.lower() in ["system", "assistant"]:
+                    mapped_dialogue.append(("Speaker 1", content))
+                elif role.lower() in ["user"]:
+                    mapped_dialogue.append(("Speaker 2", content))
+                else:
+                    mapped_dialogue.append((role, content))
+            dialogue = mapped_dialogue
+        generated_segments = []
+        sampling_rates = []
         print("🎧 Generating podcast segments (TTS audio)...")
         for speaker, text in tqdm(dialogue, desc="Generating podcast segments", unit="segment"):
             audio_arr, rate = generate_speaker_audio(text, speaker=speaker)
-            audio_segment = numpy_to_audio_segment(audio_arr, rate)
-            if final_audio is None:
-                final_audio = audio_segment
-            else:
-                final_audio += audio_segment
+            generated_segments.append(audio_arr)
+            sampling_rates.append(rate)
+        final_audio = concatenate_audio_segments(generated_segments, sampling_rates)
         final_audio_path = f"/data/final_podcast_audio_{file_uuid}.wav"
         final_audio.export(final_audio_path, format="wav")
         print("🎶 Final podcast audio generated and saved to", final_audio_path)
@@ -386,6 +423,8 @@ def audio_player(file_path="/data/final_podcast_audio.wav"):
 
 if __name__ == "__main__":
     serve()
+
+
 
 
 
