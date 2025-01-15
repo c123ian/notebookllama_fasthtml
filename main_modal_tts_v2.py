@@ -33,7 +33,7 @@ MODELS_DIR = "/llama_mini"
 TTS_DIR = "/tts"  
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Initial podcast writer
+# Initial podcast writer prompt
 SYS_PROMPT = """
 You are the a world-class podcast writer, you have worked as a ghost writer for Joe Rogan, Lex Fridman, Ben Shapiro, Tim Ferris. 
 
@@ -45,13 +45,13 @@ Your job is to write word by word, even "umm, hmmm, right" interruptions by the 
 
 Remember Speaker 2 is new to the topic and the conversation should always have realistic anecdotes and analogies sprinkled throughout. The questions should have real world example follow ups etc
 
-Speaker 1: Leads the conversation and teaches the speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
+Speaker 1: Leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
 
 Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
 
-Make sure the tangents speaker 2 provides are quite wild or interesting. 
+Make sure the tangents Speaker 2 provides are quite wild or interesting. 
 
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from the second speaker. 
+Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2. 
 
 It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
 
@@ -60,8 +60,8 @@ DO NOT GIVE EPISODE TITLES SEPERATELY, LET SPEAKER 1 TITLE IT IN HER SPEECH
 DO NOT GIVE CHAPTER TITLES
 IT SHOULD STRICTLY BE THE DIALOGUES
 """
-# Second podcast re-writer
-SYSTEMP_PROMPT ="""
+
+SYSTEMP_PROMPT = """
 You are an international oscar winnning screenwriter
 
 You have been working with multiple award winning podcasters.
@@ -72,13 +72,13 @@ Make it as engaging as possible, Speaker 1 and 2 will be simulated by different 
 
 Remember Speaker 2 is new to the topic and the conversation should always have realistic anecdotes and analogies sprinkled throughout. The questions should have real world example follow ups etc
 
-Speaker 1: Leads the conversation and teaches the speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
+Speaker 1: Leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
 
 Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
 
-Make sure the tangents speaker 2 provides are quite wild or interesting. 
+Make sure the tangents Speaker 2 provides are quite wild or interesting. 
 
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from the Speaker 2.
+Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2.
 
 REMEMBER THIS WITH YOUR HEART
 The TTS Engine for Speaker 1 cannot do "umms, hmms" well so keep it straight text
@@ -157,6 +157,10 @@ def serve():
         device_map=device
     )
     tokenizer = AutoTokenizer.from_pretrained(MODELS_DIR)
+    # Ensure a proper pad token is set.
+    if tokenizer.pad_token is None or tokenizer.pad_token == tokenizer.eos_token:
+        tokenizer.add_special_tokens({'pad_token': '<pad>'})
+        tokenizer.pad_token = '<pad>'
     model, tokenizer = accelerator.prepare(model, tokenizer)
     tts_model = ParlerTTSForConditionalGeneration.from_pretrained(TTS_DIR,
         torch_dtype=torch.bfloat16,
@@ -173,14 +177,14 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         if not isinstance(text, str):
             text = str(text)
         desc = speaker1_description if speaker == "Speaker 1" else speaker2_description
-        print(f"🎤 Generating TTS audio for {speaker}...")
+        print(f"🎤 Generating TTS audio for {speaker}... Text length: {len(text)} characters")
         input_ids = tts_tokenizer(desc, return_tensors="pt").input_ids.to(device)
         prompt_input_ids = tts_tokenizer(text, return_tensors="pt").input_ids.to(device)
         generation = tts_model.generate(input_ids=input_ids, prompt_input_ids=prompt_input_ids)
-        # Convert the generated tensor to float32 on CPU
         generation = generation.cpu().float()
         audio_arr = generation.numpy().squeeze()
         return audio_arr, tts_model.config.sampling_rate
+    
     def create_word_bounded_chunks(text, target_chunk_size):
         words = text.split()
         chunks = []
@@ -197,14 +201,22 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 current_length += word_length
         if current_chunk:
             chunks.append(' '.join(current_chunk))
+        print(f"🧩 Split text into {len(chunks)} chunk(s).")
         return chunks
+
     def process_chunk(text_chunk, chunk_num, model, tokenizer):
         conversation = [
             {"role": "system", "content": SYS_PROMPT},
             {"role": "user", "content": text_chunk},
         ]
         prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        # Logging: Check token count and prompt length.
+        inputs_pre = tokenizer(prompt, add_special_tokens=True)
+        token_count = len(inputs_pre['input_ids'])
+        print(f"Chunk {chunk_num}: Prompt has {token_count} tokens and {len(prompt)} characters.")
+        # Ensure padding and truncation are enabled, providing attention_mask.
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             output = model.generate(
                 **inputs,
@@ -212,14 +224,19 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 top_p=0.9,
                 max_new_tokens=512
             )
-        processed_text = tokenizer.decode(output[0], skip_special_tokens=True)[len(prompt):].strip()
+        full_output = tokenizer.decode(output[0], skip_special_tokens=True)
+        processed_text = full_output[len(prompt):].strip()
+        new_token_count = len(tokenizer.tokenize(processed_text))
+        print(f"Chunk {chunk_num}: Generated {new_token_count} new tokens.")
         return processed_text
+
     async def process_uploaded_file(filename):
         print(f"📥 File '{filename}' uploaded!")
         output_file = os.path.join("/data", f"clean_{filename}")
         input_file = os.path.join(UPLOAD_FOLDER, filename)
         with open(input_file, "r", encoding="utf-8") as file:
             text = file.read()
+        # Split the text into chunks (adjust target_chunk_size as needed)
         chunks = create_word_bounded_chunks(text, 1000)
         with open(output_file, "w", encoding="utf-8") as out_file:
             for chunk_num, chunk in enumerate(chunks):
@@ -228,9 +245,11 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 out_file.flush()
         print(f"🧹 File '{filename}' cleaned and saved to '{output_file}'!")
         return output_file
+
     def load_audio_base64(audio_path: str):
         with open(audio_path, "rb") as f:
             return base64.b64encode(f.read()).decode("ascii")
+        
     def audio_player(file_path="/data/final_podcast_audio.wav"):
         import os
         if not os.path.exists(file_path):
@@ -238,6 +257,7 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         with open(file_path, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("ascii")
         return Audio(src=f"data:audio/wav;base64,{audio_data}", controls=True)
+        
     def progress_bar(percent):
         return Progress(
             id="progress_bar",
@@ -247,9 +267,11 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             hx_trigger="every 500ms",
             hx_swap="outerHTML",
         )
+        
     def read_file_to_string(file_path):
         with open(file_path, 'r', encoding='utf-8') as file:
             return file.read()
+            
     @rt("/")
     def homepage():
         upload_input = Input(type="file", name="document", accept=".txt", required=True)
@@ -266,6 +288,7 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             Div(id="upload-info"),
             cls="container mx-auto p-4"
         )
+        
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
         form = await request.form()
@@ -316,11 +339,18 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         final_rewritten_text = second_outputs[0]["generated_text"]
         print("✅ Script rewritten:")
         print(final_rewritten_text)
-        try:
-            dialogue = ast.literal_eval(final_rewritten_text)
-        except Exception as e:
-            print("❌ Error parsing final_rewritten_text to a Python literal:", e)
-            dialogue = [("Speaker 1", final_rewritten_text)]
+        # Use type checking to decide how to parse
+        if isinstance(final_rewritten_text, str):
+            try:
+                start_idx = final_rewritten_text.find('[')
+                end_idx = final_rewritten_text.rfind(']') + 1
+                candidate = final_rewritten_text[start_idx:end_idx] if start_idx != -1 and end_idx != -1 else final_rewritten_text
+                dialogue = ast.literal_eval(candidate)
+            except Exception as e:
+                print("❌ Error parsing final_rewritten_text to a Python literal:", e)
+                dialogue = [("Speaker 1", final_rewritten_text)]
+        else:
+            dialogue = final_rewritten_text
         final_audio = None
         print("🎧 Generating podcast segments (TTS audio)...")
         for speaker, text in tqdm(dialogue, desc="Generating podcast segments", unit="segment"):
@@ -350,6 +380,8 @@ def audio_player(file_path="/data/final_podcast_audio.wav"):
 
 if __name__ == "__main__":
     serve()
+
+
 
 
 
