@@ -4,6 +4,7 @@ import io
 import ast
 import base64
 import sqlite3
+import uuid
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -33,7 +34,6 @@ MODELS_DIR = "/llama_mini"
 TTS_DIR = "/tts"  
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Initial podcast writer prompt
 SYS_PROMPT = """
 You are the a world-class podcast writer, you have worked as a ghost writer for Joe Rogan, Lex Fridman, Ben Shapiro, Tim Ferris. 
 
@@ -126,7 +126,7 @@ def numpy_to_audio_segment(audio_arr, sampling_rate):
 
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="40GB"),
+    gpu=modal.gpu.A100(count=1, size="80GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
@@ -162,7 +162,8 @@ def serve():
         tokenizer.add_special_tokens({'pad_token': '<pad>'})
         tokenizer.pad_token = '<pad>'
     model, tokenizer = accelerator.prepare(model, tokenizer)
-    tts_model = ParlerTTSForConditionalGeneration.from_pretrained(TTS_DIR,
+    tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
+        TTS_DIR,
         torch_dtype=torch.bfloat16,
         device_map=device,
     )
@@ -180,7 +181,10 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         print(f"🎤 Generating TTS audio for {speaker}... Text length: {len(text)} characters")
         input_ids = tts_tokenizer(desc, return_tensors="pt").input_ids.to(device)
         prompt_input_ids = tts_tokenizer(text, return_tensors="pt").input_ids.to(device)
-        generation = tts_model.generate(input_ids=input_ids, prompt_input_ids=prompt_input_ids)
+        generation = tts_model.generate(
+            input_ids=input_ids, 
+            prompt_input_ids=prompt_input_ids
+        )
         generation = generation.cpu().float()
         audio_arr = generation.numpy().squeeze()
         return audio_arr, tts_model.config.sampling_rate
@@ -210,11 +214,9 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             {"role": "user", "content": text_chunk},
         ]
         prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
-        # Logging: Check token count and prompt length.
         inputs_pre = tokenizer(prompt, add_special_tokens=True)
         token_count = len(inputs_pre['input_ids'])
         print(f"Chunk {chunk_num}: Prompt has {token_count} tokens and {len(prompt)} characters.")
-        # Ensure padding and truncation are enabled, providing attention_mask.
         inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
@@ -236,7 +238,6 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         input_file = os.path.join(UPLOAD_FOLDER, filename)
         with open(input_file, "r", encoding="utf-8") as file:
             text = file.read()
-        # Split the text into chunks (adjust target_chunk_size as needed)
         chunks = create_word_bounded_chunks(text, 1000)
         with open(output_file, "w", encoding="utf-8") as out_file:
             for chunk_num, chunk in enumerate(chunks):
@@ -250,7 +251,7 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         with open(audio_path, "rb") as f:
             return base64.b64encode(f.read()).decode("ascii")
         
-    def audio_player(file_path="/data/final_podcast_audio.wav"):
+    def audio_player(file_path):
         import os
         if not os.path.exists(file_path):
             return P("No audio file found.")
@@ -291,6 +292,8 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
+        # Generate a UUID to use for output file naming
+        file_uuid = uuid.uuid4().hex
         form = await request.form()
         docfile = form.get("document")
         if not docfile:
@@ -339,7 +342,6 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         final_rewritten_text = second_outputs[0]["generated_text"]
         print("✅ Script rewritten:")
         print(final_rewritten_text)
-        # Use type checking to decide how to parse
         if isinstance(final_rewritten_text, str):
             try:
                 start_idx = final_rewritten_text.find('[')
@@ -351,6 +353,9 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 dialogue = [("Speaker 1", final_rewritten_text)]
         else:
             dialogue = final_rewritten_text
+        # If dialogue is a list of dictionaries, convert to tuples.
+        if isinstance(dialogue, list) and dialogue and isinstance(dialogue[0], dict):
+            dialogue = [(item.get("role", ""), item.get("content", "")) for item in dialogue]
         final_audio = None
         print("🎧 Generating podcast segments (TTS audio)...")
         for speaker, text in tqdm(dialogue, desc="Generating podcast segments", unit="segment"):
@@ -360,12 +365,13 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 final_audio = audio_segment
             else:
                 final_audio += audio_segment
-        final_audio_path = "/data/final_podcast_audio.wav"
+        final_audio_path = f"/data/final_podcast_audio_{file_uuid}.wav"
         final_audio.export(final_audio_path, format="wav")
         print("🎶 Final podcast audio generated and saved to", final_audio_path)
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
+            Div(audio_player(final_audio_path), id="audio-player"),
             id="processing-results"
         )
     return fasthtml_app
