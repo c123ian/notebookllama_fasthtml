@@ -12,12 +12,12 @@ from scipy.io import wavfile
 from pydub import AudioSegment
 from accelerate import Accelerator
 from fasthtml.common import (
-    fast_app, H1, P, Div, Form, Input, Button, Group,
+    fast_app, H1, P, Div, Form, Button, Group,
     Title, Main, Progress, Audio
 )
 from parler_tts import ParlerTTSForConditionalGeneration
 
-app = modal.App("test-audiogen-example")
+app = modal.App("simple-fasthtml-example")
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -30,8 +30,7 @@ image = (
         "parler_tts"
     )
 )
-
-pdf_volume = modal.Volume.lookup("pdf_uploads")  # Must exist
+pdf_volume = modal.Volume.lookup("pdf_uploads")
 MODELS_DIR = "/llama_mini"
 TTS_DIR = "/tts"
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,9 +41,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
-    volumes={MODELS_DIR: modal.Volume.lookup("llama_mini"),
-             TTS_DIR: modal.Volume.lookup("tts"),
-             "/pdf_uploads": pdf_volume}
+    volumes={
+        MODELS_DIR: modal.Volume.lookup("llama_mini"),
+        TTS_DIR: modal.Volume.lookup("tts"),
+        "/pdf_uploads": pdf_volume
+    }
 )
 @modal.asgi_app()
 def serve():
@@ -60,19 +61,23 @@ def serve():
         tts_tokenizer.add_special_tokens({'pad_token': '<pad>'})
         tts_tokenizer.pad_token = '<pad>'
     tts_model, tts_tokenizer = accelerator.prepare(tts_model, tts_tokenizer)
+    
     def preprocess_text(text):
         text = text.strip()
         text = re.sub(r'\s+', ' ', text)
         text = re.sub(r'[^\w\s.,!?-]', '', text)
         return text
+
     def numpy_to_audio_segment(audio_arr, sr):
         audio_int16 = (audio_arr * 32767).astype(np.int16)
         bio = io.BytesIO()
         wavfile.write(bio, sr, audio_int16)
         bio.seek(0)
         return AudioSegment.from_wav(bio)
-    speaker1_description = "Laura's voice is expressive and dramatic in delivery, speaking at a moderately fast pace with a very close recording that almost has no background noise."
-    speaker2_description = "Gary's voice is monotone, speaking at a slow pace with a very close recording that almost has no background noise."
+
+    speaker1_description = "Laura's voice is expressive and dramatic..."
+    speaker2_description = "Gary's voice is expressive and dramatic..."
+    
     def generate_speaker_audio(text, speaker):
         text = preprocess_text(str(text))
         desc = speaker1_description if speaker == "Speaker 1" else speaker2_description
@@ -84,21 +89,25 @@ def serve():
             audio_arr = gen.cpu().float().numpy().squeeze()
             if np.isnan(audio_arr).any() or np.isinf(audio_arr).any():
                 audio_arr = np.zeros(int(tts_model.config.sampling_rate))
-        except:
+        except Exception as e:
+            print(f"Error generating TTS audio: {e}")
             audio_arr = np.zeros(int(tts_model.config.sampling_rate))
         return audio_arr, tts_model.config.sampling_rate
+
     def concatenate_audio_segments(segments, rates):
         final_audio = None
         for seg, sr in zip(segments, rates):
             audio_seg = numpy_to_audio_segment(seg, sr)
             final_audio = audio_seg if final_audio is None else final_audio.append(audio_seg, crossfade=100)
         return final_audio
+
     def audio_player(file_path):
         if not os.path.exists(file_path):
             return P("No audio file found.")
         with open(file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("ascii")
         return Audio(src=f"data:audio/wav;base64,{b64}", controls=True)
+
     @rt("/")
     def homepage():
         form = Form(
@@ -108,6 +117,7 @@ def serve():
             method="post"
         )
         return Title("Podcast TTS"), Main(H1("Click 'Test' to Generate Audio"), form, Div(id="result"))
+
     @rt("/test", methods=["POST"])
     async def test_gen(request):
         file_uuid = "pkl_tts_" + os.urandom(4).hex()
@@ -116,16 +126,20 @@ def serve():
             return Div(P("⚠️ No 'podcast_ready_data.pkl' found."), id="result")
         with open(pickle_path, "rb") as f:
             final_rewritten_text = pickle.load(f)
-        # Expect final_rewritten_text to be a list of tuples
+        print("Loaded final_rewritten_text from pickle:", final_rewritten_text)
+        # If the data is a string, try converting it to a Python literal
         if isinstance(final_rewritten_text, str):
             try:
                 final_rewritten_text = ast.literal_eval(final_rewritten_text)
-            except:
+            except Exception as e:
+                print("Error parsing final_rewritten_text:", e)
                 final_rewritten_text = [("Speaker 1", final_rewritten_text)]
+        print("After ast.literal_eval, final_rewritten_text is:", final_rewritten_text)
         segments, rates = [], []
         for speaker, text in tqdm(final_rewritten_text, desc="Generating segments"):
             arr, sr = generate_speaker_audio(text, speaker)
-            segments.append(arr); rates.append(sr)
+            segments.append(arr)
+            rates.append(sr)
         final_audio = concatenate_audio_segments(segments, rates)
         final_audio_path = f"/pdf_uploads/final_podcast_audio_{file_uuid}.wav"
         final_audio.export(final_audio_path, format="wav")
@@ -138,5 +152,6 @@ def serve():
 
 if __name__ == "__main__":
     serve()
+
 
 
