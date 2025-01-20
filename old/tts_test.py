@@ -7,7 +7,7 @@ import pickle
 import re
 import numpy as np
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoProcessor, BarkModel
 from scipy.io import wavfile
 from pydub import AudioSegment
 from accelerate import Accelerator
@@ -15,9 +15,8 @@ from fasthtml.common import (
     fast_app, H1, P, Div, Form, Button, Group,
     Title, Main, Progress, Audio
 )
-from parler_tts import ParlerTTSForConditionalGeneration
 
-app = modal.App("simple-fasthtml-example")
+app = modal.App("bark-tts-example")
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -26,24 +25,22 @@ image = (
         "accelerate>=0.26.0",
         "scipy",
         "pydub",
-        "tqdm",
-        "parler_tts"
+        "tqdm"
     )
 )
+
 pdf_volume = modal.Volume.lookup("pdf_uploads")
-MODELS_DIR = "/llama_mini"
-TTS_DIR = "/tts"
+BARK_DIR = "/bark"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 @app.function(
     image=image,
     gpu=modal.gpu.A100(count=1, size="80GB"),
-    container_idle_timeout=10 * 60,
-    timeout=24 * 60 * 60,
+    container_idle_timeout=10*60,
+    timeout=24*60*60,
     allow_concurrent_inputs=100,
     volumes={
-        MODELS_DIR: modal.Volume.lookup("llama_mini"),
-        TTS_DIR: modal.Volume.lookup("tts"),
+        BARK_DIR: modal.Volume.lookup("bark"),
         "/pdf_uploads": pdf_volume
     }
 )
@@ -51,17 +48,15 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def serve():
     import os
     fasthtml_app, rt = fast_app()
-    print("🚀 Loading TTS model...")
+    print("🚀 Loading Bark model...")
     accelerator = Accelerator()
-    tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
-        TTS_DIR, torch_dtype=torch.bfloat16, device_map=device
-    )
-    tts_tokenizer = AutoTokenizer.from_pretrained(TTS_DIR)
-    if tts_tokenizer.pad_token is None:
-        tts_tokenizer.add_special_tokens({'pad_token': '<pad>'})
-        tts_tokenizer.pad_token = '<pad>'
-    tts_model, tts_tokenizer = accelerator.prepare(tts_model, tts_tokenizer)
-    
+
+    # Load Bark from local volume
+    bark_model = BarkModel.from_pretrained(BARK_DIR, torch_dtype=torch.float16).to(device)
+    bark_processor = AutoProcessor.from_pretrained(BARK_DIR)
+
+    bark_model, bark_processor = accelerator.prepare(bark_model, bark_processor)
+
     def preprocess_text(text):
         text = text.strip()
         text = re.sub(r'\s+', ' ', text)
@@ -75,24 +70,23 @@ def serve():
         bio.seek(0)
         return AudioSegment.from_wav(bio)
 
-    speaker1_description = "Laura's voice is expressive and dramatic..."
-    speaker2_description = "Gary's voice is expressive and dramatic..."
-    
+    # Choose two distinct voice presets
+    speaker1_preset = "v2/en_speaker_0"
+    speaker2_preset = "v2/en_speaker_6"
+
     def generate_speaker_audio(text, speaker):
         text = preprocess_text(str(text))
-        desc = speaker1_description if speaker == "Speaker 1" else speaker2_description
-        input_data = tts_tokenizer(desc, return_tensors="pt", max_length=512, padding="max_length").to(device)
-        prompt_data = tts_tokenizer(text, return_tensors="pt", max_length=512, padding="max_length").to(device)
+        voice_preset = speaker1_preset if speaker == "Speaker 1" else speaker2_preset
+        inputs = bark_processor(text, voice_preset=voice_preset, return_tensors="pt").to(device)
         try:
-            gen = tts_model.generate(input_data["input_ids"], attention_mask=input_data["attention_mask"],
-                                     prompt_input_ids=prompt_data["input_ids"], temperature=0.9)
+            gen = bark_model.generate(**inputs, temperature=0.9, semantic_temperature=0.8)
             audio_arr = gen.cpu().float().numpy().squeeze()
             if np.isnan(audio_arr).any() or np.isinf(audio_arr).any():
-                audio_arr = np.zeros(int(tts_model.config.sampling_rate))
+                audio_arr = np.zeros(24000)
         except Exception as e:
             print(f"Error generating TTS audio: {e}")
-            audio_arr = np.zeros(int(tts_model.config.sampling_rate))
-        return audio_arr, tts_model.config.sampling_rate
+            audio_arr = np.zeros(24000)
+        return audio_arr, 24000
 
     def concatenate_audio_segments(segments, rates):
         final_audio = None
@@ -116,7 +110,7 @@ def serve():
             hx_swap="afterbegin",
             method="post"
         )
-        return Title("Podcast TTS"), Main(H1("Click 'Test' to Generate Audio"), form, Div(id="result"))
+        return Title("Bark Podcast TTS"), Main(H1("Click 'Test' to Generate Audio"), form, Div(id="result"))
 
     @rt("/test", methods=["POST"])
     async def test_gen(request):
@@ -127,19 +121,20 @@ def serve():
         with open(pickle_path, "rb") as f:
             final_rewritten_text = pickle.load(f)
         print("Loaded final_rewritten_text from pickle:", final_rewritten_text)
-        # If the data is a string, try converting it to a Python literal
+
         if isinstance(final_rewritten_text, str):
             try:
                 final_rewritten_text = ast.literal_eval(final_rewritten_text)
             except Exception as e:
                 print("Error parsing final_rewritten_text:", e)
                 final_rewritten_text = [("Speaker 1", final_rewritten_text)]
-        print("After ast.literal_eval, final_rewritten_text is:", final_rewritten_text)
+
         segments, rates = [], []
         for speaker, text in tqdm(final_rewritten_text, desc="Generating segments"):
             arr, sr = generate_speaker_audio(text, speaker)
             segments.append(arr)
             rates.append(sr)
+
         final_audio = concatenate_audio_segments(segments, rates)
         final_audio_path = f"/pdf_uploads/final_podcast_audio_{file_uuid}.wav"
         final_audio.export(final_audio_path, format="wav")
@@ -148,10 +143,20 @@ def serve():
             Div(audio_player(final_audio_path), id="audio-player"),
             id="result"
         )
+
     return fasthtml_app
 
 if __name__ == "__main__":
     serve()
+
+
+
+
+
+
+
+
+
 
 
 

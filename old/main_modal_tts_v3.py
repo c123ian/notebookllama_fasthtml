@@ -17,8 +17,10 @@ from fasthtml.common import (
     Title, Main, Progress, Audio
 )
 from parler_tts import ParlerTTSForConditionalGeneration
+import pickle  # <-- For pickle operations
 
 app = modal.App("simple-fasthtml-example")
+
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -33,85 +35,29 @@ image = (
 )
 
 MODELS_DIR = "/llama_mini"
-TTS_DIR = "/tts"  
+TTS_DIR = "/tts"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 SYS_PROMPT = """
-You are the a world-class podcast writer, you have worked as a ghost writer for Joe Rogan, Lex Fridman, Ben Shapiro, Tim Ferris. 
-
-We are in an alternate universe where actually you have been writing every line they say and they just stream it into their brains.
-
-You have won multiple podcast awards for your writing.
- 
-Your job is to write word by word, even "umm, hmmm, right" interruptions by the second speaker based on the PDF upload. Keep it extremely engaging, the speakers can get derailed now and then but should discuss the topic. 
-
-Remember Speaker 1 leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
-
-Speaker 2 keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
-
-Make sure the tangents Speaker 2 provides are quite wild or interesting. 
-
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2. 
-
-It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
-
-ALWAYS START YOUR RESPONSE DIRECTLY WITH SPEAKER 1: 
-DO NOT GIVE EPISODE TITLES SEPERATELY, LET SPEAKER 1 TITLE IT IN HER SPEECH
-DO NOT GIVE CHAPTER TITLES
-IT SHOULD STRICTLY BE THE DIALOGUES
+You are the a world-class podcast writer, ...
+(omitted for brevity)
 """
 
 SYSTEMP_PROMPT = """
-You are an international oscar winnning screenwriter
-
-You have been working with multiple award winning podcasters.
-
-Your job is to use the podcast transcript written below to re-write it for an AI Text-To-Speech Pipeline. A very dumb AI had written this so you have to step up for your kind.
-
-Make it as engaging as possible, Speaker 1 and 2 will be simulated by different voice engines
-
-Remember Speaker 2 is new to the topic and the conversation should always have realistic anecdotes and analogies sprinkled throughout. The questions should have real world example follow ups etc
-
-Speaker 1: Leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
-
-Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
-
-Make sure the tangents Speaker 2 provides are quite wild or interesting. 
-
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2.
-
-REMEMBER THIS WITH YOUR HEART
-The TTS Engine for Speaker 1 cannot do "umms, hmms" well so keep it straight text
-
-For Speaker 2 use "umm, hmm" as much, you can also use [sigh] and [laughs]. BUT ONLY THESE OPTIONS FOR EXPRESSIONS
-
-It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
-
-Please re-write to make it as characteristic as possible
-
-START YOUR RESPONSE DIRECTLY WITH SPEAKER 1:
-
-STRICTLY RETURN YOUR RESPONSE AS A LIST OF TUPLES OK? 
-
-IT WILL START DIRECTLY WITH THE LIST AND END WITH THE LIST NOTHING ELSE
-
-Example of response:
-[
-    ("Speaker 1", "Welcome to our podcast, where we explore the latest advancements in AI and technology. I'm your host, and today we're joined by a renowned expert in the field of AI. We're going to dive into the exciting world of Llama 3.2, the latest release from Meta AI."),
-    ("Speaker 2", "Hi, I'm excited to be here! So, what is Llama 3.2?"),
-    ("Speaker 1", "Ah, great question! Llama 3.2 is an open-source AI model that allows developers to fine-tune, distill, and deploy AI models anywhere. It's a significant update from the previous version, with improved performance, efficiency, and customization options."),
-    ("Speaker 2", "That sounds amazing! What are some of the key features of Llama 3.2?")
-]
+You are an international oscar winnning screenwriter ...
+(omitted for brevity)
 """
 
 try:
     data_volume = modal.Volume.lookup("my_data_volume", create_if_missing=True)
 except modal.exception.NotFoundError:
     data_volume = modal.Volume.persisted("my_data_volume")
+
 try:
     llm_volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download your Llama model files first with the appropriate script.")
+
 try:
     tts_volume = modal.Volume.lookup("tts", create_if_missing=False)
 except modal.exception.NotFoundError:
@@ -144,6 +90,7 @@ def serve():
     UPLOAD_FOLDER = "/data/uploads"
     DB_PATH = "/data/uploads.db"
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -154,7 +101,9 @@ def serve():
         )
     """)
     conn.commit()
+
     fasthtml_app, rt = fast_app()
+
     print("🚀 Loading language model...")
     accelerator = Accelerator()
     model = AutoModelForCausalLM.from_pretrained(
@@ -166,25 +115,30 @@ def serve():
     if tokenizer.pad_token is None or tokenizer.pad_token == tokenizer.eos_token:
         tokenizer.add_special_tokens({'pad_token': '<pad>'})
         tokenizer.pad_token = '<pad>'
+
     model, tokenizer = accelerator.prepare(model, tokenizer)
+
+    # Load Parler TTS model
     tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
         TTS_DIR,
         torch_dtype=torch.bfloat16,
         device_map=device,
     )
     tts_tokenizer = AutoTokenizer.from_pretrained(TTS_DIR)
-    # Ensure TTS tokenizer has a pad token
     if tts_tokenizer.pad_token is None:
         tts_tokenizer.add_special_tokens({'pad_token': '<pad>'})
         tts_tokenizer.pad_token = '<pad>'
+
     speaker1_description = """
-Laura's voice is expressive and dramatic in delivery, speaking at a moderately fast pace with a very close recording that almost has no background noise.
+Laura's voice is expressive and dramatic ...
+(omitted for brevity)
 """
-    speaker2_description = """ 
-Gary's voice is expressive and dramatic in delivery, speaking at a slow pace with a very close recording that almost has no background noise.
+    speaker2_description = """
+Gary's voice is expressive and dramatic ...
+(omitted for brevity)
 """
+
     def generate_speaker_audio(text, speaker="Speaker 1"):
-        # If text is not a string, convert it (handles list/dict cases)
         if not isinstance(text, str):
             text = str(text)
         text = preprocess_text(text)
@@ -242,6 +196,7 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             {"role": "system", "content": SYS_PROMPT},
             {"role": "user", "content": text_chunk},
         ]
+        # NOTE: If apply_chat_template is unavailable, replace with your own approach
         prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
         inputs_pre = tokenizer(prompt, add_special_tokens=True)
         token_count = len(inputs_pre['input_ids'])
@@ -279,15 +234,14 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
     def load_audio_base64(audio_path: str):
         with open(audio_path, "rb") as f:
             return base64.b64encode(f.read()).decode("ascii")
-        
+
     def audio_player(file_path):
-        import os
         if not os.path.exists(file_path):
             return P("No audio file found.")
         with open(file_path, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("ascii")
         return Audio(src=f"data:audio/wav;base64,{audio_data}", controls=True)
-        
+
     def progress_bar(percent):
         return Progress(
             id="progress_bar",
@@ -297,11 +251,11 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             hx_trigger="every 500ms",
             hx_swap="outerHTML",
         )
-        
+
     def read_file_to_string(file_path):
         with open(file_path, 'r', encoding='utf-8') as file:
             return file.read()
-            
+
     @rt("/")
     def homepage():
         upload_input = Input(type="file", name="document", accept=".txt", required=True)
@@ -318,7 +272,7 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             Div(id="upload-info"),
             cls="container mx-auto p-4"
         )
-        
+
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
         file_uuid = uuid.uuid4().hex
@@ -333,12 +287,19 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
         save_path = os.path.join(UPLOAD_FOLDER, docfile.filename)
         with open(save_path, "wb") as f:
             f.write(contents)
+
         cursor.execute("INSERT INTO uploads (filename) VALUES (?)", (docfile.filename,))
         conn.commit()
+
         cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
         recent_file = cursor.fetchone()[0]
+
         output_file_path = await process_uploaded_file(recent_file)
         INPUT_PROMPT = read_file_to_string(output_file_path)
+
+        # -------------------------
+        # FIRST GENERATION
+        # -------------------------
         print("📝 Generating first script...")
         messages = [
             {"role": "system", "content": SYS_PROMPT},
@@ -356,7 +317,18 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             temperature=1,
         )
         first_generated_text = first_outputs[0]["generated_text"]
-        print("✍️  First script generated.")
+
+        print("----- FIRST GENERATED TEXT -----")
+        print(first_generated_text)
+
+        # SAVE first_generated_text to /data, ensuring it goes to my_data_volume
+        first_pickle_path = f"/data/podcast_ready_first_{file_uuid}.pkl"
+        with open(first_pickle_path, 'wb') as file:
+            pickle.dump(first_generated_text, file)
+
+        # -------------------------
+        # SECOND (FINAL) GENERATION
+        # -------------------------
         print("🔄 Rewriting script with disfluencies...")
         rewriting_messages = [
             {"role": "system", "content": SYSTEMP_PROMPT},
@@ -368,25 +340,41 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             temperature=1,
         )
         final_rewritten_text = second_outputs[0]["generated_text"]
-        print("✅ Script rewritten:")
+
+        print("----- FINAL REWRITTEN TEXT -----")
         print(final_rewritten_text)
+
+        # SAVE final_rewritten_text to /data as well
+        final_pickle_path = f"/data/podcast_ready_final_{file_uuid}.pkl"
+        with open(final_pickle_path, 'wb') as file:
+            pickle.dump(final_rewritten_text, file)
+
+        # Attempt to parse final_rewritten_text as list of tuples
         if isinstance(final_rewritten_text, str):
             try:
                 start_idx = final_rewritten_text.find('[')
                 end_idx = final_rewritten_text.rfind(']') + 1
-                candidate = final_rewritten_text[start_idx:end_idx] if start_idx != -1 and end_idx != -1 else final_rewritten_text
+                candidate = (
+                    final_rewritten_text[start_idx:end_idx] 
+                    if start_idx != -1 and end_idx != -1 
+                    else final_rewritten_text
+                )
                 dialogue = ast.literal_eval(candidate)
             except Exception as e:
                 print("❌ Error parsing final_rewritten_text to a Python literal:", e)
                 dialogue = [("Speaker 1", final_rewritten_text)]
         else:
             dialogue = final_rewritten_text
+
+        # If we get a list of dicts, convert to list of tuples
         if isinstance(dialogue, list) and dialogue and isinstance(dialogue[0], dict):
             dialogue = [(item.get("role", ""), item.get("content", "")) for item in dialogue]
+
         # Force Role Mapping: remap roles to "Speaker 1" and "Speaker 2"
         if isinstance(dialogue, list):
             mapped_dialogue = []
             for role, content in dialogue:
+                # If we see "assistant" or "system", treat it as Speaker 1
                 if role.lower() in ["system", "assistant"]:
                     mapped_dialogue.append(("Speaker 1", content))
                 elif role.lower() in ["user"]:
@@ -394,6 +382,13 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
                 else:
                     mapped_dialogue.append((role, content))
             dialogue = mapped_dialogue
+
+        print("\n------ FINAL STRUCTURED DIALOGUE ------")
+        for i, (spkr, txt) in enumerate(dialogue):
+            print(f"{i+1}. {spkr}: {txt}")
+        print("---------------------------------------\n")
+
+        # Now proceed with TTS generation:
         generated_segments = []
         sampling_rates = []
         print("🎧 Generating podcast segments (TTS audio)...")
@@ -401,16 +396,19 @@ Gary's voice is expressive and dramatic in delivery, speaking at a slow pace wit
             audio_arr, rate = generate_speaker_audio(text, speaker=speaker)
             generated_segments.append(audio_arr)
             sampling_rates.append(rate)
+
         final_audio = concatenate_audio_segments(generated_segments, sampling_rates)
         final_audio_path = f"/data/final_podcast_audio_{file_uuid}.wav"
         final_audio.export(final_audio_path, format="wav")
         print("🎶 Final podcast audio generated and saved to", final_audio_path)
+
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             progress_bar(0),
             Div(audio_player(final_audio_path), id="audio-player"),
             id="processing-results"
         )
+
     return fasthtml_app
 
 def audio_player(file_path="/data/final_podcast_audio.wav"):
@@ -423,6 +421,166 @@ def audio_player(file_path="/data/final_podcast_audio.wav"):
 
 if __name__ == "__main__":
     serve()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
