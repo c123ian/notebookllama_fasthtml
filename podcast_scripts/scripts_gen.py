@@ -1,4 +1,4 @@
-import modal
+import modal 
 import torch
 import io
 import ast
@@ -6,7 +6,9 @@ import base64
 import sqlite3
 import uuid
 import re
+import pickle
 import numpy as np
+import os
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from scipy.io import wavfile
@@ -17,7 +19,14 @@ from fasthtml.common import (
     Title, Main, Progress, Audio
 )
 
+# Create/lookup your new volume
+try:
+    podcast_volume = modal.Volume.lookup("podcast_volume", create_if_missing=True)
+except modal.exception.NotFoundError:
+    podcast_volume = modal.Volume.persisted("podcast_volume")
+
 app = modal.App("script_gen")
+
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git")
@@ -35,9 +44,7 @@ image = (
 
 LLAMA_DIR = "/llama_mini"
 DATA_DIR = "/data"
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # -----------------------------
 # Prompt #1 for initial text generation
@@ -111,28 +118,10 @@ Example of response:
     ("Speaker 2", "That sounds amazing! What are some of the key features of Llama 3.2?")
 ]
 """
-
-try:
-    data_volume = modal.Volume.lookup("my_data_volume", create_if_missing=True)
-except modal.exception.NotFoundError:
-    data_volume = modal.Volume.persisted("my_data_volume")
 try:
     llm_volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
 except modal.exception.NotFoundError:
-    raise Exception("Download your Llama model files first with the appropriate script.")
-
-def numpy_to_audio_segment(audio_arr, sampling_rate):
-    audio_int16 = (audio_arr * 32767).astype(np.int16)
-    byte_io = io.BytesIO()
-    wavfile.write(byte_io, sampling_rate, audio_int16)
-    byte_io.seek(0)
-    return AudioSegment.from_wav(byte_io)
-
-def preprocess_text(text):
-    text = text.strip()
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[^\w\s.,!?-]', '', text)
-    return text
+    raise Exception("Download your Llama model files first.")
 
 @app.function(
     image=image,
@@ -140,14 +129,21 @@ def preprocess_text(text):
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
-    volumes={LLAMA_DIR: llm_volume, "/data": data_volume}
+    # Attach both your existing data_volume (if you still need it) and the new podcast_volume
+    volumes={LLAMA_DIR: llm_volume, "/data": podcast_volume}
 )
 @modal.asgi_app()
 def serve():
     import os
+
+    # We will create subfolders inside /data which is attached to podcast_volume
     UPLOAD_FOLDER = "/data/uploads"
+    SCRIPTS_FOLDER = "/data/podcast_scripts_table"
     DB_PATH = "/data/uploads.db"
+
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    os.makedirs(SCRIPTS_FOLDER, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -158,9 +154,9 @@ def serve():
         )
     """)
     conn.commit()
+
     fasthtml_app, rt = fast_app()
-    
-    # Load Llama model
+
     print("Loading Llama model...")
     accelerator = Accelerator()
     model = AutoModelForCausalLM.from_pretrained(
@@ -180,30 +176,25 @@ def serve():
         current_chunk = []
         current_length = 0
         for word in words:
-            word_length = len(word) + 1
-            if current_length + word_length > target_chunk_size and current_chunk:
+            wlen = len(word) + 1
+            if current_length + wlen > target_chunk_size and current_chunk:
                 chunks.append(' '.join(current_chunk))
                 current_chunk = [word]
-                current_length = word_length
+                current_length = wlen
             else:
                 current_chunk.append(word)
-                current_length += word_length
+                current_length += wlen
         if current_chunk:
             chunks.append(' '.join(current_chunk))
-        print(f"🧩 Split text into {len(chunks)} chunk(s).")
         return chunks
 
-    def process_chunk(text_chunk, chunk_num, model, tokenizer):
+    def process_chunk(text_chunk, chunk_num):
         conversation = [
             {"role": "system", "content": SYS_PROMPT},
             {"role": "user", "content": text_chunk},
         ]
         prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
-        inputs_pre = tokenizer(prompt, add_special_tokens=True)
-        token_count = len(inputs_pre['input_ids'])
-        print(f"Chunk {chunk_num}: Prompt has {token_count} tokens and {len(prompt)} characters.")
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(device)
         with torch.no_grad():
             output = model.generate(
                 **inputs,
@@ -213,30 +204,25 @@ def serve():
             )
         full_output = tokenizer.decode(output[0], skip_special_tokens=True)
         processed_text = full_output[len(prompt):].strip()
-        new_token_count = len(tokenizer.tokenize(processed_text))
-        print(f"Chunk {chunk_num}: Generated {new_token_count} new tokens.")
         return processed_text
 
-    async def process_uploaded_file(filename):
-        print(f"📥 File '{filename}' uploaded!")
-        output_file = os.path.join("/data", f"clean_{filename}")
-        input_file = os.path.join(UPLOAD_FOLDER, filename)
-        with open(input_file, "r", encoding="utf-8") as file:
-            text = file.read()
-        chunks = create_word_bounded_chunks(text, 1000)
-        with open(output_file, "w", encoding="utf-8") as out_file:
-            for chunk_num, chunk in enumerate(chunks):
-                cleaned_chunk = process_chunk(chunk, chunk_num, model, tokenizer)
-                out_file.write(cleaned_chunk + "\n")
-                out_file.flush()
-        print(f"🧹 File '{filename}' cleaned and saved to '{output_file}'!")
-        return output_file
-        
-        
+    async def process_uploaded_file(original_name):
+        file_uuid = uuid.uuid4().hex
+        input_path = os.path.join(UPLOAD_FOLDER, original_name)
+        cleaned_path = os.path.join(UPLOAD_FOLDER, f"upload_{file_uuid}.txt")
+        with open(input_path, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+        chunks = create_word_bounded_chunks(raw_text, 1000)
+        with open(cleaned_path, "w", encoding="utf-8") as out_file:
+            for i, c in enumerate(chunks):
+                out_file.write(process_chunk(c, i) + "\n")
+        print(f"🧹 File '{original_name}' cleaned and saved to '{cleaned_path}'!")
+        return cleaned_path
+
     def read_file_to_string(file_path):
-        with open(file_path, 'r', encoding='utf-8') as file:
-            return file.read()
-            
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+
     @rt("/")
     def homepage():
         upload_input = Input(type="file", name="document", accept=".txt", required=True)
@@ -247,38 +233,31 @@ def serve():
             enctype="multipart/form-data",
             method="post",
         )
-        return Title("Simple Upload + Test Script Gen"), Main(
-            H1("Simple Upload + Test Script Gen"),
+        return Title("Simple Upload + Script Gen"), Main(
+            H1("Simple Upload + Script Gen"),
             form,
-            Div(id="upload-info"),
-            cls="container mx-auto p-4"
+            Div(id="upload-info")
         )
-        
+
     @rt("/upload", methods=["POST"])
     async def upload_doc(request):
-        file_uuid = uuid.uuid4().hex
         form = await request.form()
         docfile = form.get("document")
         if not docfile:
-            return Div(
-                P("⚠️ No file uploaded. Please try again.", cls="text-red-500"),
-                id="upload-info"
-            )
+            return Div(P("No file uploaded."), id="upload-info")
+
         contents = await docfile.read()
         save_path = os.path.join(UPLOAD_FOLDER, docfile.filename)
         with open(save_path, "wb") as f:
             f.write(contents)
         cursor.execute("INSERT INTO uploads (filename) VALUES (?)", (docfile.filename,))
         conn.commit()
-        cursor.execute("SELECT filename FROM uploads ORDER BY uploaded_at DESC LIMIT 1")
-        recent_file = cursor.fetchone()[0]
-        output_file_path = await process_uploaded_file(recent_file)
-        INPUT_PROMPT = read_file_to_string(output_file_path)
+
+        # Clean file
+        cleaned_file_path = await process_uploaded_file(docfile.filename)
+        input_text = read_file_to_string(cleaned_file_path)
+
         print("📝 Generating first script...")
-        messages = [
-            {"role": "system", "content": SYS_PROMPT},
-            {"role": "user", "content": INPUT_PROMPT},
-        ]
         first_pipeline = __import__("transformers").pipeline(
             "text-generation",
             model=model,
@@ -286,211 +265,68 @@ def serve():
             device_map="auto",
         )
         first_outputs = first_pipeline(
-            messages,
-            max_new_tokens=8126,
-            temperature=1,
+            [{"role": "system", "content": SYS_PROMPT}, {"role": "user", "content": input_text}],
+            max_new_tokens=1500,
+            temperature=1.0,
         )
         first_generated_text = first_outputs[0]["generated_text"]
         print("✍️  First script generated.")
+
         print("🔄 Rewriting script with disfluencies...")
-        rewriting_messages = [
-            {"role": "system", "content": SYSTEMP_PROMPT},
-            {"role": "user", "content": first_generated_text},
-        ]
         second_outputs = first_pipeline(
-            rewriting_messages,
-            max_new_tokens=8126,
-            temperature=1,
+            [{"role": "system", "content": SYSTEMP_PROMPT}, {"role": "user", "content": first_generated_text}],
+            max_new_tokens=1500,
+            temperature=1.0,
         )
         final_rewritten_text = second_outputs[0]["generated_text"]
-        print("✅ Script rewritten:")
-        print(final_rewritten_text)
-        if isinstance(final_rewritten_text, str):
-            try:
-                start_idx = final_rewritten_text.find('[')
-                end_idx = final_rewritten_text.rfind(']') + 1
-                candidate = final_rewritten_text[start_idx:end_idx] if start_idx != -1 and end_idx != -1 else final_rewritten_text
-                dialogue = ast.literal_eval(candidate)
-            except Exception as e:
-                print("❌ Error parsing final_rewritten_text to a Python literal:", e)
-                dialogue = [("Speaker 1", final_rewritten_text)]
-        else:
-            dialogue = final_rewritten_text
-        if isinstance(dialogue, list) and dialogue and isinstance(dialogue[0], dict):
-            dialogue = [(item.get("role", ""), item.get("content", "")) for item in dialogue]
-        try:
-            # Force Role Mapping: remap roles to "Speaker 1" and "Speaker 2"
-            if isinstance(dialogue, list):
-                mapped_dialogue = []
-                for role, content in dialogue:
-                    if role.lower() in ["system", "assistant"]:
-                        mapped_dialogue.append(("Speaker 1", content))
-                    elif role.lower() in ["user"]:
-                        mapped_dialogue.append(("Speaker 2", content))
-                    else:
-                        mapped_dialogue.append((role, content))
-                dialogue = mapped_dialogue
-        except Exception as e:
-            print("❌ Error during dialogue mapping:", e)
 
-        print("✅ dialogue written:")
-        print(dialogue)
+        # Parse out the list-of-tuples
+        try:
+            start_idx = final_rewritten_text.find("[")
+            end_idx = final_rewritten_text.rfind("]") + 1
+            candidate = final_rewritten_text[start_idx:end_idx] if start_idx != -1 and end_idx != -1 else final_rewritten_text
+            dialogue = ast.literal_eval(candidate)
+        except:
+            dialogue = [("Speaker 1", final_rewritten_text)]
+
+        if isinstance(dialogue, list) and dialogue and isinstance(dialogue[0], dict):
+            # unify to (role, content)
+            dialogue = [(d.get("role", ""), d.get("content", "")) for d in dialogue]
+
+        # Force roles
+        mapped = []
+        for role, content in dialogue:
+            if role.lower() in ["system", "assistant"]:
+                mapped.append(("Speaker 1", content))
+            elif role.lower() == "user":
+                mapped.append(("Speaker 2", content))
+            else:
+                mapped.append((role, content))
+        dialogue = mapped
+
+        # Save both final_rewritten_text and dialogue as pickled list-of-tuples in podcast_scripts_table
+        file_uuid = uuid.uuid4().hex
+        final_pickle_path = os.path.join(SCRIPTS_FOLDER, f"final_rewritten_text_{file_uuid}.pkl")
+        dialogue_pickle_path = os.path.join(SCRIPTS_FOLDER, f"dialogue_{file_uuid}.pkl")
+
+        with open(final_pickle_path, "wb") as f:
+            # If you truly need the final_rewritten_text as a *list of tuples*, wrap it:
+            # pickle.dump([("Output", final_rewritten_text)], f)
+            # Otherwise store as you see fit:
+            pickle.dump(dialogue, f)
+
+        with open(dialogue_pickle_path, "wb") as f:
+            pickle.dump(dialogue, f)
+
+        print(f"✅ final_rewritten_text saved to {final_pickle_path}")
+        print(f"✅ dialogue saved to {dialogue_pickle_path}")
+
         return Div(
             P(f"✅ File '{docfile.filename}' uploaded and processed successfully!", cls="text-green-500"),
             id="processing-results"
         )
+
     return fasthtml_app
 
 if __name__ == "__main__":
     serve()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
