@@ -1,4 +1,4 @@
-import modal 
+import modal
 import torch
 import io
 import ast
@@ -19,7 +19,6 @@ from fasthtml.common import (
     Title, Main, Progress, Audio
 )
 
-# Create/lookup your new volume
 try:
     podcast_volume = modal.Volume.lookup("podcast_volume", create_if_missing=True)
 except modal.exception.NotFoundError:
@@ -46,37 +45,31 @@ LLAMA_DIR = "/llama_mini"
 DATA_DIR = "/data"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# -----------------------------
-# Prompt #1 for initial text generation
-# -----------------------------
 SYS_PROMPT = """
-You are the a world-class podcast writer, you have worked as a ghost writer for Joe Rogan, Lex Fridman, Ben Shapiro, Tim Ferris. 
+You are the a world-class podcast writer, you have worked as a ghost writer for Joe Rogan, Lex Fridman, Ben Shapiro, Tim Ferris.
 
 We are in an alternate universe where actually you have been writing every line they say and they just stream it into their brains.
 
 You have won multiple podcast awards for your writing.
- 
-Your job is to write word by word, even "umm, hmmm, right" interruptions by the second speaker based on the PDF upload. Keep it extremely engaging, the speakers can get derailed now and then but should discuss the topic. 
+
+Your job is to write word by word, even "umm, hmmm, right" interruptions by the second speaker based on the PDF upload. Keep it extremely engaging, the speakers can get derailed now and then but should discuss the topic.
 
 Remember Speaker 1 leads the conversation and teaches Speaker 2, gives incredible anecdotes and analogies when explaining. Is a captivating teacher that gives great anecdotes
 
 Speaker 2 keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
 
-Make sure the tangents Speaker 2 provides are quite wild or interesting. 
+Make sure the tangents Speaker 2 provides are quite wild or interesting.
 
-Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2. 
+Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2.
 
 It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
 
-ALWAYS START YOUR RESPONSE DIRECTLY WITH SPEAKER 1: 
-DO NOT GIVE EPISODE TITLES SEPERATELY, LET SPEAKER 1 TITLE IT IN HER SPEECH
+ALWAYS START YOUR RESPONSE DIRECTLY WITH SPEAKER 1:
+DO NOT GIVE EPISODE TITLES SEPARATELY, LET SPEAKER 1 TITLE IT IN HER SPEECH
 DO NOT GIVE CHAPTER TITLES
 IT SHOULD STRICTLY BE THE DIALOGUES
 """
 
-# -----------------------------
-# Prompt #2 re-writer
-# -----------------------------
 SYSTEMP_PROMPT = """
 You are an international oscar winnning screenwriter
 
@@ -92,7 +85,7 @@ Speaker 1: Leads the conversation and teaches Speaker 2, gives incredible anecdo
 
 Speaker 2: Keeps the conversation on track by asking follow up questions. Gets super excited or confused when asking questions. Is a curious mindset that asks very interesting confirmation questions
 
-Make sure the tangents Speaker 2 provides are quite wild or interesting. 
+Make sure the tangents Speaker 2 provides are quite wild or interesting.
 
 Ensure there are interruptions during explanations or there are "hmm" and "umm" injected throughout from Speaker 2.
 
@@ -106,7 +99,7 @@ Please re-write to make it as characteristic as possible
 
 START YOUR RESPONSE DIRECTLY WITH SPEAKER 1:
 
-STRICTLY RETURN YOUR RESPONSE AS A LIST OF TUPLES OK? 
+STRICTLY RETURN YOUR RESPONSE AS A LIST OF TUPLES OK?
 
 IT WILL START DIRECTLY WITH THE LIST AND END WITH THE LIST NOTHING ELSE
 
@@ -118,6 +111,7 @@ Example of response:
     ("Speaker 2", "That sounds amazing! What are some of the key features of Llama 3.2?")
 ]
 """
+
 try:
     llm_volume = modal.Volume.lookup("llama_mini", create_if_missing=False)
 except modal.exception.NotFoundError:
@@ -221,50 +215,45 @@ def serve():
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
 
-    # Helper: flatten dialogue if needed (only consider tuples where speaker is "assistant")
     def extract_assistant_dialogue(obj):
+        """
+        Recursively collect only the 'assistant' outputs as ("Speaker 1", content).
+        """
         result = []
         if isinstance(obj, list):
             for item in obj:
                 result.extend(extract_assistant_dialogue(item))
         elif isinstance(obj, dict):
-            # We only care if role is assistant (or system, since we force them to Speaker 1 later)
             if obj.get("role", "").lower() in ["assistant"]:
                 content = obj.get("content", "")
                 result.append(("Speaker 1", content))
             elif "content" in obj:
-                # Recursively check content
                 result.extend(extract_assistant_dialogue(obj["content"]))
         elif isinstance(obj, tuple):
             if len(obj) >= 2:
                 role, content = obj[0], obj[1]
-                if isinstance(role, str) and role.lower() in ["assistant"]:
+                if isinstance(role, str) and role.lower() == "assistant":
                     result.append(("Speaker 1", content))
                 elif isinstance(content, (list, dict, tuple)):
                     result.extend(extract_assistant_dialogue(content))
-        elif isinstance(obj, str):
-            # Not processing raw strings here.
-            pass
         return result
 
-    # Helper: if a nested dialogue block exists (starts with "[" and first tuple begins with "Welcome"), use it.
-    def select_final_dialogue(flattened):
-        # Look for a candidate dialogue that seems like the main output.
-        for tup in flattened:
-            speaker, content = tup
-            if isinstance(content, str) and content.lstrip().startswith("Welcome"):
-                return flattened  # assume this is the full dialogue block
-        return flattened
-
-    # Final post-processing: format the dialogue to a standardized string representation.
     def prepare_for_audio(dialogue):
+        """
+        Build a valid Python literal string from a list of (speaker, content) tuples.
+        - We escape any quotes and backslashes
+        - We replace literal newlines with \n
+        - We wrap with [ ... ] so ast.literal_eval(...) -> list-of-tuples
+        """
         lines = ["["]
         for speaker, text in dialogue:
-            clean_text = text.strip().replace('"', r'\"')
-            lines.append(f'    ("{speaker}", "{clean_text}"),')
+            # Replace backslash first, then quotes, then newlines
+            safe_text = text.replace("\\", "\\\\")\
+                            .replace('"', '\\"')\
+                            .replace("\n", "\\n")
+            lines.append(f'    ("{speaker}", "{safe_text}"),')
         lines.append("]")
-        final_str = "\n".join(lines)
-        return final_str
+        return "\n".join(lines)
 
     @rt("/")
     def homepage():
@@ -296,7 +285,7 @@ def serve():
         cursor.execute("INSERT INTO uploads (filename) VALUES (?)", (docfile.filename,))
         conn.commit()
 
-        # Clean file (synchronous)
+        # Clean the file
         cleaned_file_path = process_uploaded_file(docfile.filename)
         input_text = read_file_to_string(cleaned_file_path)
 
@@ -308,7 +297,10 @@ def serve():
             device_map="auto",
         )
         first_outputs = first_pipeline(
-            [{"role": "system", "content": SYS_PROMPT}, {"role": "user", "content": input_text}],
+            [
+                {"role": "system", "content": SYS_PROMPT},
+                {"role": "user", "content": input_text}
+            ],
             max_new_tokens=1500,
             temperature=1.0,
         )
@@ -317,13 +309,16 @@ def serve():
 
         print("🔄 Rewriting script with disfluencies...")
         second_outputs = first_pipeline(
-            [{"role": "system", "content": SYSTEMP_PROMPT}, {"role": "user", "content": first_generated_text}],
+            [
+                {"role": "system", "content": SYSTEMP_PROMPT},
+                {"role": "user", "content": first_generated_text}
+            ],
             max_new_tokens=1500,
             temperature=1.0,
         )
         final_rewritten_text = second_outputs[0]["generated_text"]
 
-        # Parse out the candidate list-of-tuples
+        # Attempt to parse out a list of tuples from final_rewritten_text
         try:
             start_idx = final_rewritten_text.find("[")
             end_idx = final_rewritten_text.rfind("]") + 1
@@ -332,39 +327,37 @@ def serve():
         except Exception:
             parsed = [("Speaker 1", final_rewritten_text)]
 
-        # Extract only the assistant content from the parsed candidate.
         assistant_only = extract_assistant_dialogue(parsed)
         if not assistant_only:
-            # If nothing was extracted, try flattening all tuples and filtering by role.
+            # fallback if none found
             flattened = []
             if isinstance(parsed, list):
                 for item in parsed:
                     if isinstance(item, tuple) and len(item) >= 2:
                         flattened.append(item)
-            assistant_only = [ (r, t) for r,t in flattened if r.lower() in ["assistant"] ]
-        # If still empty, default to entire parsed dialogue; then force roles:
+            # filter by role
+            assistant_only = [(r, t) for r, t in flattened if r.lower() == "assistant"]
         if not assistant_only:
             assistant_only = parsed
 
-        # Force roles: change "assistant" to "Speaker 1" and "user" to "Speaker 2"
+        # Force roles: 'assistant' -> Speaker 1, 'user' -> Speaker 2
         final_dialogue = []
         for role, content in assistant_only:
-            if isinstance(role, str):
-                if role.lower() in ["assistant", "system"]:
-                    final_dialogue.append(("Speaker 1", content))
-                elif role.lower() == "user":
-                    final_dialogue.append(("Speaker 2", content))
-                else:
-                    final_dialogue.append((role, content))
+            lr = role.lower() if isinstance(role, str) else ""
+            if lr in ["assistant", "system"]:
+                final_dialogue.append(("Speaker 1", content))
+            elif lr == "user":
+                final_dialogue.append(("Speaker 2", content))
             else:
-                final_dialogue.append((str(role), content))
-        # If multiple sections exist, select the candidate that seems to start with "Welcome"
-        final_dialogue = select_final_dialogue(final_dialogue)
+                final_dialogue.append((role, content))
 
-        # Now prepare a standardized string representation.
+        # Reverse so second output is first
+        final_dialogue = final_dialogue[::-1]
+
+        # Build a valid literal string
         final_formatted = prepare_for_audio(final_dialogue)
 
-        # Save the final_formatted string as a pickled object.
+        # Save as pickled string
         file_uuid = uuid.uuid4().hex
         final_pickle_path = os.path.join(SCRIPTS_FOLDER, f"final_rewritten_text_{file_uuid}.pkl")
         dialogue_pickle_path = os.path.join(SCRIPTS_FOLDER, f"dialogue_{file_uuid}.pkl")
@@ -387,6 +380,8 @@ def serve():
 
 if __name__ == "__main__":
     serve()
+
+
 
 
 
